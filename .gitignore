@@ -1,0 +1,16 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.pyo
+*.log
+nohup.txt
+*.bak
+*.bak_*
+*.local_bak_*
+*.remote_server_*
+*.tmp
+.env
+.env.*
+!.env.example
+target/
+*.obj
