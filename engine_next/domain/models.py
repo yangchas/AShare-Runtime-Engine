@@ -10,6 +10,7 @@ from .enums import (
     FetchIntent,
     FailedPromotionType,
     LeaderTier,
+    OperatorStyleHint,
     RunPhase,
     SourceName,
     StartupAction,
@@ -98,7 +99,9 @@ class StockStateSnapshot:
     vol_ratio: float = 0.0
     speed_1m: float = 0.0
     amount_2m: float = 0.0
+    amount_2m_rank_pct: float = 1.0
     amount_5m: float = 0.0
+    amount_5m_rank_pct: float = 1.0
     vector_3m: float = 0.0
     vector_5m: float = 0.0
     resonance_factor: float = 1.0
@@ -134,6 +137,7 @@ class StockStateSnapshot:
     is_yest_limit: bool = False
     is_locked: bool = False
     real_plate_names: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -143,11 +147,13 @@ class StockProfileAssessment:
     leader_tier: LeaderTier
     stage: StockStage
     failed_promotion_type: FailedPromotionType
+    operator_style_hint: OperatorStyleHint
     feedback_state: FeedbackState
     exposure_state: ExposureState
     trade_window: TradeWindowState
     darkness_exposure_score: int
     continuation_score: int
+    retail_attention_proxy: int
     notes: tuple[str, ...] = ()
 
 
@@ -207,6 +213,36 @@ class ThemeTradeFact:
     high_open_fail_count: int = 0
     low_open_repair_count: int = 0
     expansion_count: int = 0
+
+
+@dataclass(frozen=True)
+class ThemeOpeningValidation:
+    plate_name: str
+    predicted_script: str = "unknown"
+    validation_state: str = "watch"
+    tradable_level: str = "watch"
+    front_row_confirmed: bool = False
+    mid_follow_confirmed: bool = False
+    high_level_feedback: str = "unknown"
+    amount_2m_rank_pct: float = 1.0
+    amount_2m_ratio_vs_auction: float = 0.0
+    net_inflow_delta_yi: float = 0.0
+    is_migrating_in: bool = False
+    is_migrating_out: bool = False
+    evidence: tuple[str, ...] = ()
+    invalid_reason: str = ""
+
+
+@dataclass(frozen=True)
+class OpeningValidationBundle:
+    trade_date: str
+    phase: str
+    confirmed_themes: Dict[str, ThemeOpeningValidation] = field(default_factory=dict)
+    falsified_themes: Dict[str, ThemeOpeningValidation] = field(default_factory=dict)
+    watch_themes: Dict[str, ThemeOpeningValidation] = field(default_factory=dict)
+    main_validated_theme: str = ""
+    backup_validated_theme: str = ""
+    notes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -298,6 +334,10 @@ class StockSelectionContext:
     open_undertake_score: float = 0.0
     shape_quality_score: float = 0.0
     execution_quality_score: float = 0.0
+    shape_bucket: str = "unknown"
+    execution_bucket: str = "unknown"
+    undertake_bucket: str = "unknown"
+    risk_bucket: str = "normal"
     theme_tradable: bool = False
     theme_fakeout_level: str = "unknown"
     theme_x_score: float = 0.0
@@ -308,7 +348,6 @@ class StockSelectionContext:
     stock_execution_rank_in_theme_pct: float = 1.0
     stock_shape_rank_in_theme_pct: float = 1.0
     total_score: float = 0.0
-
     notes: tuple[str, ...] = ()
 
 
@@ -386,10 +425,13 @@ class IntradayContext:
     yesterday_hot_plate_map: Dict[str, dict]
     yest_limit_map: Dict[str, dict]
     auction_map: Dict[str, dict]
+    latest_quote_timestamp_ms: int = 0
+    latest_quote_time: str = ""
+    latest_quote_age_seconds: Optional[int] = None
     session_facts: SessionFacts = field(default_factory=SessionFacts)
+    opening_validation_bundle: OpeningValidationBundle | None = None
     cached_theme_conclusions: Dict[str, str] = field(default_factory=dict)
     sector_flow_trajectories: Dict[str, Any] = field(default_factory=dict)
-    opening_validation_bundle: "OpeningValidationBundle | None" = None
     notes: tuple[str, ...] = ()
 
 
@@ -436,34 +478,4 @@ class IntradayMarketSummary:
     open_2m_top10_vs_prev_ratio: float = 1.0
     open_2m_top20_vs_prev_ratio: float = 1.0
     battle_status: str = ""
-    notes: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class ThemeOpeningValidation:
-    plate_name: str
-    predicted_script: str
-    validation_state: str
-    tradable_level: str
-    front_row_confirmed: bool = False
-    mid_follow_confirmed: bool = False
-    high_level_feedback: str = "unknown"
-    amount_2m_rank_pct: float = 1.0
-    amount_2m_ratio_vs_auction: float = 0.0
-    net_inflow_delta_yi: float = 0.0
-    is_migrating_in: bool = False
-    is_migrating_out: bool = False
-    evidence: tuple[str, ...] = ()
-    invalid_reason: str = ""
-
-
-@dataclass(frozen=True)
-class OpeningValidationBundle:
-    trade_date: str
-    phase: str
-    confirmed_themes: Dict[str, ThemeOpeningValidation] = field(default_factory=dict)
-    falsified_themes: Dict[str, ThemeOpeningValidation] = field(default_factory=dict)
-    watch_themes: Dict[str, ThemeOpeningValidation] = field(default_factory=dict)
-    main_validated_theme: str = ""
-    backup_validated_theme: str = ""
     notes: tuple[str, ...] = ()

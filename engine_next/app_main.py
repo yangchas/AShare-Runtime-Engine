@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import Iterable
@@ -32,6 +33,11 @@ from engine_next.runtime.intraday_context_builder import (
 )
 from engine_next.runtime.market_runtime_summary import MarketRuntimeSummaryResult, MarketRuntimeSummaryService
 from engine_next.runtime.offline_sync_executor import OfflineSyncRequest, ServerOnlyOfflineSyncExecutor
+from engine_next.runtime.production_fact_assembly import build_production_auction_facts, build_readonly_td_auction_query
+from engine_next.runtime.production_reporting import ProductionReportingCoordinator
+from engine_next.runtime.reporting_lifecycle import ReportingEvent, ReportingLifecycle
+from engine_next.runtime.notification_service import RuntimeNotificationService
+from engine_next.runtime.open_confirmation import build_open_confirmation_observation
 from engine_next.runtime.original_timeline import iter_phase_events
 from engine_next.runtime.renderers.live_phase_summary_renderer import (
     LivePhaseSummaryRenderer,
@@ -183,6 +189,7 @@ class EngineAppRequest:
     cached_structural_factor_gap: dict[str, bool] | None = None
     historical_replay: bool = False
     run_integrated_sync: bool = True
+    execution_mode: str = "normal"
 
 
 @dataclass(frozen=True)
@@ -249,6 +256,7 @@ class EngineApp:
     MIN_FULL_UNIVERSE_SIZE = 1000
     STARTUP_AUDIT_CHECKPOINTS = ("08:30", "09:00", "17:40")
     AUCTION_FINALIZE_EARLIEST = dt_time(9, 25, 10)
+    OPENING_FACTS_EARLIEST = dt_time(9, 32, 10)
 
     def __init__(
         self,
@@ -257,12 +265,19 @@ class EngineApp:
         offline_executor: ServerOnlyOfflineSyncExecutor | None = None,
         intraday_context_builder: IntradayContextBuilder | None = None,
         redis_client: object | None = None,
+        production_reporting: ProductionReportingCoordinator | None = None,
+        intraday_hub: IntradayDataHub | None = None,
+        notification_service: RuntimeNotificationService | None = None,
     ) -> None:
         self._startup_coordinator = startup_coordinator or RuntimeStartupCoordinator()
         self._offline_executor = offline_executor or ServerOnlyOfflineSyncExecutor()
         self._intraday_context_builder = intraday_context_builder or IntradayContextBuilder()
         self._redis_client = redis_client
-        self._intraday_hub = IntradayDataHub(redis_client=redis_client)
+        self._production_reporting = production_reporting
+        self._intraday_hub = intraday_hub or IntradayDataHub(redis_client=redis_client)
+        self._notification_service = notification_service or (
+            production_reporting.notification_service if production_reporting is not None else None
+        ) or RuntimeNotificationService(redis_client=self.redis)
         self._market_runtime_summary_service = MarketRuntimeSummaryService(redis_client=self.redis)
         self._auction_runtime = AuctionRuntimeController(
             intraday_hub=self._intraday_hub,
@@ -289,6 +304,10 @@ class EngineApp:
         self._night_recap = NightRecapController()
         self._live_summary_renderer = LivePhaseSummaryRenderer()
         self._last_scheduled_event_token: str | None = None
+        # Reporting delivery dedupe is owned by ReportingLifecycle/Redis.  This
+        # set only prevents the scheduler from resolving the same event twice
+        # in one process; it is populated only after a terminal Outcome.
+        self._resolved_reporting_event_keys: set[str] = set()
         self._last_render_token: str | None = None
         self._last_auction_cleanup_trade_date: str | None = None
         self._last_intraday_auction_recap_trade_date: str | None = None
@@ -509,9 +528,12 @@ class EngineApp:
         *,
         phase: RunPhase,
         trade_date: str,
+        now: datetime,
         lifecycle_audit_ran: bool,
     ) -> bool:
         if phase != RunPhase.INTRADAY or not lifecycle_audit_ran:
+            return False
+        if not self._is_opening_strategy_window(now, phase):
             return False
         if self._last_intraday_auction_recap_trade_date == trade_date:
             return False
@@ -1113,6 +1135,15 @@ class EngineApp:
                 scheduled_event_name="auction_followup_0926",
                 scheduled_event_label="auction follow-up event 09:26",
             )
+        if dt_time(9, 32, 10) <= now.time() < dt_time(9, 34):
+            return RuntimeLoopDecision(
+                name="opening_facts_checkpoint",
+                label="opening facts checkpoint 09:32",
+                audit_token=None,
+                should_run_lifecycle_audit=False,
+                scheduled_event_name="opening_facts_0932",
+                scheduled_event_label="opening facts event 09:32",
+            )
         if (
             self._startup_bootstrap.last_audit_trade_date != trade_date
             or self._startup_bootstrap.last_audit_token is None
@@ -1182,6 +1213,120 @@ class EngineApp:
             audit_token=None,
             should_run_lifecycle_audit=False,
         )
+
+    @staticmethod
+    def _reporting_event_specs() -> tuple[tuple[str, dt_time], ...]:
+        """Return the existing production reporting schedule.
+
+        This is a small catalog used for due discovery, not a second
+        scheduler.  The formal normal windows remain owned by
+        ``ReportingLifecycle``.
+        """
+        return (
+            ("auction_facts_0926", dt_time(9, 26)),
+            ("opening_facts_0932", dt_time(9, 32, 10)),
+        )
+
+    def _collect_due_reporting_events(
+        self,
+        *,
+        now: datetime,
+        trade_date: str,
+        requested_mode: str = "normal",
+        historical_replay: bool = False,
+    ) -> tuple[ReportingEvent, ...]:
+        """Collect every overdue production event not terminally resolved.
+
+        The previous minute-tag checks could lose an event when a legitimate
+        runtime task crossed its minute.  Due discovery is based on the
+        scheduled wall-clock time and therefore handles one or many crossed
+        slots.  A process-level key is marked only after ``handle`` returns a
+        complete Outcome; merely starting or attempting an event is not a
+        terminal resolution.
+        """
+        if self._production_reporting is None or historical_replay:
+            return ()
+        resolved = getattr(self, "_resolved_reporting_event_keys", set())
+        events: list[ReportingEvent] = []
+        for event_name, scheduled_clock in self._reporting_event_specs():
+            scheduled_at = now.replace(
+                hour=scheduled_clock.hour,
+                minute=scheduled_clock.minute,
+                second=scheduled_clock.second,
+                microsecond=0,
+            )
+            key = f"{trade_date}:{event_name}"
+            if now < scheduled_at or key in resolved:
+                continue
+            events.append(
+                ReportingEvent(
+                    trade_date=trade_date,
+                    event_name=event_name,
+                    scheduled_time=scheduled_at,
+                    actual_time=now,
+                    execution_mode=requested_mode,
+                )
+            )
+        return tuple(events)
+
+    @staticmethod
+    def _reporting_outcome_is_terminal(outcome: object, event: ReportingEvent) -> bool:
+        """Require the existing Outcome contract before marking resolved."""
+        return all(
+            getattr(outcome, field, None) not in (None, "")
+            for field in ("event_name", "trade_date", "report_status", "delivery_status")
+        ) and str(getattr(outcome, "event_name", "")) == event.event_name and str(
+            getattr(outcome, "trade_date", "")
+        ) == event.trade_date
+
+    def _execute_due_reporting_events(self, *, request: EngineAppRequest) -> tuple[str, ...]:
+        """Resolve all due reporting events through the existing coordinator."""
+        notes: list[str] = []
+        resolved = getattr(self, "_resolved_reporting_event_keys", None)
+        if resolved is None:
+            resolved = set()
+            self._resolved_reporting_event_keys = resolved
+        events = self._collect_due_reporting_events(
+            now=request.now,
+            trade_date=request.trade_date,
+            requested_mode=request.execution_mode,
+            historical_replay=request.historical_replay,
+        )
+        for event in events:
+            try:
+                outcome = self._production_reporting.handle(event, request=request)
+            except Exception as exc:
+                # An unexpected scheduler/coordinator interruption is not a
+                # terminal Outcome.  Leave the key unresolved so the next
+                # cycle can discover it again, while keeping the engine loop
+                # alive and isolating the reporting side path.
+                logger.exception(
+                    "reporting event resolution interrupted; will rediscover | event=%s | trade_date=%s | error=%s",
+                    event.event_name,
+                    event.trade_date,
+                    exc,
+                )
+                notes.append(
+                    f"reporting_event | event={event.event_name} | trade_date={event.trade_date} | "
+                    f"terminal=UNRESOLVED | error={type(exc).__name__}"
+                )
+                continue
+            if self._reporting_outcome_is_terminal(outcome, event):
+                resolved.add(f"{event.trade_date}:{event.event_name}")
+            notes.append(
+                f"{event.event_name} | trade_date={getattr(outcome, 'trade_date', event.trade_date)} | "
+                f"scheduled_time={event.scheduled_time.isoformat()} | actual_time={event.actual_time.isoformat()} | "
+                f"fact_status={getattr(outcome, 'fact_status', 'unavailable')} | "
+                f"mapping_sha={getattr(outcome, 'mapping_sha', None)} | "
+                f"report_status={getattr(outcome, 'report_status', 'FAILED')} | "
+                f"delivery_status={getattr(outcome, 'delivery_status', 'FAILED')} | "
+                f"report_hash={getattr(outcome, 'report_hash', None)} | "
+                f"dedupe_key={getattr(outcome, 'dedupe_key', '')} | "
+                f"notification_status={getattr(outcome, 'notification_status', 'NOT_ATTEMPTED')} | "
+                f"execution_mode={getattr(outcome, 'execution_mode', event.execution_mode)} | "
+                f"terminal={'true' if self._reporting_outcome_is_terminal(outcome, event) else 'false'}"
+            )
+        return tuple(notes)
 
     def _render_cached_runtime_summary(
         self,
@@ -1531,9 +1676,10 @@ class EngineApp:
         phase: RunPhase,
         lifecycle_audit_ran: bool,
         scheduled_event_result: RuntimeScheduledEventResult,
+        reporting_events_executed: bool = False,
     ) -> bool:
         token = f"{request.trade_date}:{request.now.strftime('%H:%M')}"
-        if lifecycle_audit_ran or scheduled_event_result.executed:
+        if lifecycle_audit_ran or scheduled_event_result.executed or reporting_events_executed:
             self._last_render_token = token
             return True
         if phase in (RunPhase.PREMARKET, RunPhase.POSTMARKET, RunPhase.NIGHT):
@@ -1642,6 +1788,15 @@ class EngineApp:
             auction_result = replay_result.auction_result
             market_runtime_summary_result = replay_result.market_runtime_summary_result
             notes.extend(replay_result.notes)
+        elif loop_decision.scheduled_event_name == "opening_facts_0932":
+            # Reporting events are discovered and dispatched by the shared
+            # due-event collector.  This legacy checkpoint must not create a
+            # second execution or appear as a duplicate scheduled operation.
+            return RuntimeScheduledEventResult(
+                name=loop_decision.scheduled_event_name,
+                label=loop_decision.scheduled_event_label,
+                executed=False,
+            )
         elif loop_decision.scheduled_event_name == "market_close_1505":
             close_result = self._postmarket_runtime.execute_close_marker(
                 trade_date=request.trade_date,
@@ -1678,8 +1833,12 @@ class EngineApp:
     ) -> bool:
         if request.historical_replay or phase != RunPhase.INTRADAY:
             return False
+        if request.require_auction_recovery:
+            return True
+        if not _is_live_target_session(request.now, request.trade_date):
+            return False
         minute_tag = request.now.strftime("%H:%M")
-        return "09:30" <= minute_tag < "09:40"
+        return "09:30" <= minute_tag < "15:00"
 
     def _ensure_late_start_auction_recovery(
         self,
@@ -1824,6 +1983,11 @@ class EngineApp:
         )
 
         phase = infer_run_phase(request.now)
+        if self._production_reporting is not None and not request.historical_replay:
+            # Mapping is frozen once during the pre-09:25 window and only
+            # reloaded thereafter; event handlers never re-freeze it.
+            self._production_reporting.prepare_mapping(trade_date=request.trade_date, now=request.now)
+        reporting_event_notes = self._execute_due_reporting_events(request=request)
         scheduled_event_result = self._execute_scheduled_event(
             loop_decision=loop_decision,
             request=request,
@@ -1892,6 +2056,7 @@ class EngineApp:
             phase=phase,
             lifecycle_audit_ran=should_run_lifecycle_audit,
             scheduled_event_result=scheduled_event_result,
+            reporting_events_executed=bool(reporting_event_notes),
         )
         open_2m_refresh_notes = self._refresh_open_2m_runtime_summary_if_needed(
             request=request,
@@ -1934,12 +2099,14 @@ class EngineApp:
         if self._should_emit_intraday_startup_auction_recap(
             phase=phase,
             trade_date=request.trade_date,
+            now=request.now,
             lifecycle_audit_ran=should_run_lifecycle_audit,
         ):
             recap_lines = self._auction_runtime.render_auction_view(intraday_context)
             if recap_lines:
                 auction_recap_notes = [
                     "runtime_event=intraday startup auction recap",
+                    "startup_recap_scope | startup replay of auction snapshot; not the main intraday view",
                     *recap_lines,
                 ]
         notes = [f"runtime_event={loop_decision.label}"]
@@ -2143,6 +2310,8 @@ class EngineApp:
             )
         if preflight_notes:
             notes = list(preflight_notes) + notes
+        if reporting_event_notes:
+            notes = list(reporting_event_notes) + notes
         if auction_recap_notes:
             notes = auction_recap_notes + notes
         notes.extend(self._render_settlement_quality(settlement_result.settlement_payload))
@@ -2176,7 +2345,26 @@ class EngineApp:
         while max_cycles is None or cycles < max_cycles:
             request = request_builder()
             result = self.run(request)
+            # ``run`` may contain a legitimate long-running task (for
+            # example, the 09:25 finalize work).  Refresh the request after it
+            # returns so an event that became due during that work is resolved
+            # before output/sleep.  The existing process-level resolution set
+            # makes this post-run check idempotent with the in-run discovery.
+            fresh_request = request_builder()
+            post_run_reporting_notes = self._execute_due_reporting_events(request=fresh_request)
+            if post_run_reporting_notes:
+                result = replace(
+                    result,
+                    should_render=True,
+                    notes=tuple(post_run_reporting_notes) + tuple(result.notes),
+                )
             if result.should_render:
+                if result.phase == RunPhase.POSTMARKET:
+                    self._notification_service.notify_if_needed(
+                        result=result,
+                        request=request,
+                        summary_text=render_result_summary(result),
+                    )
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(f"[{timestamp}]", flush=True)
                 print(render_result_summary(result), flush=True)
@@ -2185,7 +2373,7 @@ class EngineApp:
             if max_cycles is not None and cycles >= max_cycles:
                 break
             sleep_seconds = self._resolve_loop_sleep_seconds(
-                now=request.now,
+                now=fresh_request.now,
                 phase=result.phase,
                 default_interval_seconds=interval_seconds,
             )
@@ -2680,6 +2868,89 @@ def _build_request_from_args(args) -> tuple[EngineAppRequest, str | None]:
     return request, symbols_file
 
 
+def _build_production_app() -> EngineApp:
+    """Construct the production reporting graph once at the application root."""
+    import redis
+
+    redis_client = redis.Redis(
+        host=os.getenv("REDIS_HOST", "localhost"),
+        port=int(os.getenv("REDIS_PORT", "6379")),
+        db=int(os.getenv("REDIS_DB", "0")),
+        decode_responses=True,
+    )
+    intraday_hub = IntradayDataHub(redis_client=redis_client)
+    notification_service = RuntimeNotificationService(redis_client=redis_client)
+    mapping_dir_value = os.getenv("ENGINE_NEXT_MAPPING_STATE_DIR", "").strip()
+    mapping_directory = Path(mapping_dir_value) if mapping_dir_value else (
+        Path("/home/exedev/services/engine-next/shared/runtime_state")
+        if os.name != "nt" else Path.cwd() / "runtime_state"
+    )
+    td_query = build_readonly_td_auction_query()
+
+    def auction_loader(trade_date: str, mapping_snapshot=None):
+        return build_production_auction_facts(
+            trade_date=trade_date,
+            redis_client=redis_client,
+            td_query=td_query,
+            mapping_snapshot=mapping_snapshot,
+            data_origin="production_realtime",
+        )
+
+    def opening_loader(trade_date: str, observation_cutoff: datetime, mapping_snapshot=None):
+        auction_facts = auction_loader(trade_date, mapping_snapshot)
+        q2_result = intraday_hub.fetch_online_q2_rows(trade_date, observation_cutoff)
+        observation = build_open_confirmation_observation(
+            auction_evidence={
+                "market_summary": auction_facts.market_summary,
+                "data_origin": auction_facts.data_origin,
+            },
+            plate_shadow=auction_facts.plate_shadow,
+            open_q2_rows=q2_result.rows,
+            observation_cutoff=observation_cutoff,
+            data_origin="production_realtime",
+            open_q2_format="online_rows",
+        )
+        # Preserve the existing OpenConfirmation facts and add only the
+        # already-defined Auction component availability needed by the
+        # Opening renderer.  Mapping identity remains separate from plate
+        # fact availability.
+        observation.update(
+            {
+                "mapping_status": auction_facts.mapping_status,
+                "plate_facts_status": auction_facts.plate_facts_status,
+                "unavailable_reasons": list(auction_facts.unavailable_reasons),
+                "q2_status": str(observation.get("open_source", {}).get("status") or "unavailable"),
+            }
+        )
+        return observation
+
+    lifecycle = ReportingLifecycle(
+        redis_client=redis_client,
+        enabled=os.getenv("ENGINE_NEXT_REPORTING_ENABLED", "1").strip().lower() not in {"0", "false", "off"},
+    )
+    coordinator = ProductionReportingCoordinator(
+        auction_fact_loader=auction_loader,
+        opening_fact_loader=opening_loader,
+        notification_service=notification_service,
+        lifecycle=lifecycle,
+        mapping_directory=mapping_directory,
+        redis_client=redis_client,
+    )
+    startup_coordinator = RuntimeStartupCoordinator(
+        intraday_hub=intraday_hub,
+        market_runtime_summary_service=MarketRuntimeSummaryService(redis_client=redis_client),
+    )
+    context_builder = IntradayContextBuilder(intraday_hub=intraday_hub)
+    return EngineApp(
+        startup_coordinator=startup_coordinator,
+        intraday_context_builder=context_builder,
+        redis_client=redis_client,
+        intraday_hub=intraday_hub,
+        notification_service=notification_service,
+        production_reporting=coordinator,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the minimal engine_next stage orchestrator.")
     parser.add_argument("--now", dest="now", default=None)
@@ -2700,11 +2971,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    app = EngineApp()
+    app = _build_production_app()
 
     if args.once:
         request, symbols_file = _build_request_from_args(args)
+        request = EngineAppRequest(**{**request.__dict__, "execution_mode": "manual_audit"})
         result = app.run(request)
+        if result.should_render and result.phase == RunPhase.POSTMARKET:
+            app._notification_service.notify_if_needed(
+                result=result,
+                request=request,
+                summary_text=render_result_summary(result),
+            )
         print(render_result_summary(result))
         if symbols_file and not args.symbols and not args.symbols_file:
             print(f"symbols_file={symbols_file}")

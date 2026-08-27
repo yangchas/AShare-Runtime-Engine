@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Iterable, Sequence
+from zoneinfo import ZoneInfo
 
 from engine_next.connectors import KaipanConnector, ThsHotConnector, WencaiConnector
 from engine_next.domain.enums import FetchIntent, RunPhase
@@ -14,6 +15,7 @@ from engine_next.runtime.plate_mapping_registry import (
     RUNTIME_PRIMARY_PLATE_KEY,
     RUNTIME_REASON_KEY,
     choose_primary_plate,
+    choose_runtime_primary_plate,
     decode_theme_list,
     encode_theme_list,
     is_generic_plate,
@@ -264,6 +266,10 @@ class IntradayDataHub:
     @staticmethod
     def _standardize_auction_snapshot_row(row: dict[str, Any], *, tag: str, summary: dict[str, Any]) -> dict[str, Any]:
         symbol = _normalize_symbol(row.get("symbol") or row.get("code"))
+        ask_amount_present = any(
+            key in row and row.get(key) is not None and str(row.get(key)).strip() != ""
+            for key in ("ask_amount_yuan", "ask_amount", "ar")
+        )
         return {
             "symbol": symbol,
             "name": str(row.get("name", row.get("stock_name", "")) or ""),
@@ -275,6 +281,9 @@ class IntradayDataHub:
             "auction_amount_yuan": _safe_float(row.get("auction_amount_yuan", row.get("amount", 0.0))),
             "bid_amount": _safe_float(row.get("bid_amount_yuan", row.get("bid_amount", 0.0))),
             "bid_amount_yuan": _safe_float(row.get("bid_amount_yuan", row.get("bid_amount", 0.0))),
+            "ask_amount": _safe_float(row.get("ask_amount_yuan", row.get("ask_amount", row.get("ar", 0.0)))),
+            "ask_amount_yuan": _safe_float(row.get("ask_amount_yuan", row.get("ask_amount", row.get("ar", 0.0)))),
+            "ask_amount_present": ask_amount_present,
             "snapshot_total_stocks": _safe_int(summary.get("total_stocks", 0)),
             "snapshot_high_open_count": _safe_int(summary.get("high_open_count", 0)),
             "snapshot_low_open_count": _safe_int(summary.get("low_open_count", 0)),
@@ -328,6 +337,11 @@ class IntradayDataHub:
             if isinstance(raw, dict):
                 amount = float(raw.get("amount", 0.0) or 0.0)
                 bid_amount = float(raw.get("bid_amount", 0.0) or 0.0)
+                ask_amount_present = any(
+                    key in raw and raw.get(key) is not None and str(raw.get(key)).strip() != ""
+                    for key in ("ask_amount_yuan", "ask_amount", "ar")
+                )
+                ask_amount = float(raw.get("ask_amount_yuan", raw.get("ask_amount", raw.get("ar", 0.0))) or 0.0)
                 tag = str(raw.get("tag") or "").strip()
                 source = str(raw.get("source") or "redis_anchor").strip() or "redis_anchor"
                 rows.append(
@@ -337,11 +351,14 @@ class IntradayDataHub:
                         "change_pct": normalize_auction_pct_ratio(raw.get("change_pct", 0.0)),
                         "amount": amount,
                         "bid_amount": bid_amount,
+                        "ask_amount": ask_amount,
+                        "ask_amount_yuan": ask_amount,
+                        "ask_amount_present": ask_amount_present,
                         "tag": tag,
                         "source": source,
                     }
                 )
-                if amount > 0 or bid_amount > 0 or bool(tag):
+                if amount > 0 or bid_amount > 0 or ask_amount > 0 or bool(tag):
                     has_extended_fields = True
                 continue
             rows.append(
@@ -351,6 +368,9 @@ class IntradayDataHub:
                     "change_pct": normalize_auction_pct_ratio(raw),
                     "amount": 0.0,
                     "bid_amount": 0.0,
+                    "ask_amount": 0.0,
+                    "ask_amount_yuan": 0.0,
+                    "ask_amount_present": False,
                     "source": "redis_anchor",
                 }
             )
@@ -368,6 +388,9 @@ class IntradayDataHub:
                 "change_pct": normalize_auction_pct_ratio(row.get("change_pct", 0.0)),
                 "amount": float(row.get("amount", 0.0) or 0.0),
                 "bid_amount": float(row.get("bid_amount", 0.0) or 0.0),
+                "ask_amount": float(row.get("ask_amount", row.get("ask_amount_yuan", 0.0)) or 0.0),
+                "ask_amount_yuan": float(row.get("ask_amount_yuan", row.get("ask_amount", 0.0)) or 0.0),
+                "ask_amount_present": bool(row.get("ask_amount_present", False)),
                 "tag": tag,
                 "source": source,
             }
@@ -411,6 +434,12 @@ class IntradayDataHub:
                         "change_pct": change_pct,
                         "amount": float(row.get("auction_amount_yuan", row.get("amount", 0.0)) or 0.0),
                         "bid_amount": float(row.get("bid_amount_yuan", row.get("bid_amount", 0.0)) or 0.0),
+                        "ask_amount": float(row.get("ask_amount_yuan", row.get("ask_amount", row.get("ar", 0.0))) or 0.0),
+                        "ask_amount_yuan": float(row.get("ask_amount_yuan", row.get("ask_amount", row.get("ar", 0.0))) or 0.0),
+                        "ask_amount_present": any(
+                            key in row and row.get(key) is not None and str(row.get(key)).strip() != ""
+                            for key in ("ask_amount_yuan", "ask_amount", "ar")
+                        ),
                         "source": "redis_0925",
                     }
                 )
@@ -462,6 +491,12 @@ class IntradayDataHub:
                             "change_pct": normalize_auction_pct_ratio(row.get("change_pct", 0.0)),
                             "amount": float(row.get("auction_amount_yuan", row.get("amount", 0.0)) or 0.0),
                             "bid_amount": float(row.get("bid_amount_yuan", row.get("bid_amount", 0.0)) or 0.0),
+                            "ask_amount": float(row.get("ask_amount_yuan", row.get("ask_amount", row.get("ar", 0.0))) or 0.0),
+                            "ask_amount_yuan": float(row.get("ask_amount_yuan", row.get("ask_amount", row.get("ar", 0.0))) or 0.0),
+                            "ask_amount_present": any(
+                                key in row and row.get(key) is not None and str(row.get(key)).strip() != ""
+                                for key in ("ask_amount_yuan", "ask_amount", "ar")
+                            ),
                             "source": f"redis_preview_{latest_tag}",
                         }
                     )
@@ -594,6 +629,14 @@ class IntradayDataHub:
             row["amount_delta"] = amount - prev_amount
             row["bid_amount_delta"] = _safe_float(row.get("bid_amount", 0.0)) - _safe_float(
                 previous.get("bid_amount", 0.0)
+            )
+            ask_present = bool(row.get("ask_amount_present", False)) and bool(
+                previous.get("ask_amount_present", False)
+            )
+            row["ask_amount_delta"] = (
+                _safe_float(row.get("ask_amount", 0.0)) - _safe_float(previous.get("ask_amount", 0.0))
+                if ask_present
+                else None
             )
             row["amount_ratio"] = (amount / prev_amount) if prev_amount > 0 else 0.0
 
@@ -828,7 +871,12 @@ class IntradayDataHub:
             merged_themes = prioritize_core_themes((pool_plate,), existing_themes, max_count=2)
             if merged_themes:
                 self.redis.hset(PLATE_MAPPING_S2P_KEY, symbol, encode_theme_list(merged_themes))
-            primary_plate = choose_primary_plate(merged_themes, fallback=pool_plate)
+            primary_plate = choose_runtime_primary_plate(
+                merged_themes,
+                fallback=str(self.redis.hget(RUNTIME_PRIMARY_PLATE_KEY, symbol) or "") or pool_plate,
+                pool_plate=pool_plate,
+                reason_candidates=merged_themes,
+            )
             current_plate = str(self.redis.hget(RUNTIME_PRIMARY_PLATE_KEY, symbol) or "").strip()
             if primary_plate and (
                 not current_plate
@@ -1018,6 +1066,79 @@ class IntradayDataHub:
             rows=rows,
             source="redis",
             notes=("Redis quote path is the main intraday low-latency market data source.",),
+        )
+
+    def fetch_online_q2_rows(
+        self,
+        trade_date: str,
+        observation_cutoff: datetime,
+        symbols: Iterable[str] = (),
+    ) -> IntradayFetchResult:
+        """Read the production Q2 view in one batched, time-bounded operation.
+
+        This path is intentionally separate from :meth:`fetch_redis_quotes`:
+        it never falls back to ``stock:quote`` and therefore cannot silently
+        replace the authoritative online-Q2 source with a legacy quote.
+        """
+        normalized_date = str(trade_date or "").strip()
+        if len(normalized_date) != 10:
+            raise ValueError("trade_date must be YYYY-MM-DD")
+        if observation_cutoff.tzinfo is None:
+            cutoff = observation_cutoff.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        else:
+            cutoff = observation_cutoff.astimezone(ZoneInfo("Asia/Shanghai"))
+        cutoff_ms = int(cutoff.timestamp() * 1000)
+        normalized_symbols = tuple(
+            dict.fromkeys(
+                _normalize_symbol(raw_symbol)
+                for raw_symbol in symbols
+                if _normalize_symbol(raw_symbol)
+            )
+        )
+        if not normalized_symbols:
+            active_key = f"q2:active:{normalized_date.replace('-', '')}"
+            try:
+                if hasattr(self.redis, "smembers"):
+                    normalized_symbols = tuple(
+                        dict.fromkeys(
+                            _normalize_symbol(value)
+                            for value in (self.redis.smembers(active_key) or ())
+                            if _normalize_symbol(value)
+                        )
+                    )
+                if not normalized_symbols and hasattr(self.redis, "scan_iter"):
+                    normalized_symbols = tuple(
+                        dict.fromkeys(
+                            _normalize_symbol(str(key).removeprefix(self._redis_q2_prefix))
+                            for key in self.redis.scan_iter(match=f"{self._redis_q2_prefix}*", count=512)
+                            if str(key) != active_key
+                            and _normalize_symbol(str(key).removeprefix(self._redis_q2_prefix))
+                        )
+                    )
+            except Exception:
+                normalized_symbols = ()
+        keys = [f"{self._redis_q2_prefix}{symbol}" for symbol in normalized_symbols]
+        rows: list[dict[str, Any]] = []
+        for symbol, raw_quote in zip(normalized_symbols, self._batch_hgetall(keys)):
+            if not raw_quote or not _is_q2_equity_quote(symbol, raw_quote):
+                continue
+            row = self._standardize_q2_quote(symbol, raw_quote)
+            logical_timestamp = _safe_int(row.get("timestamp", 0))
+            if logical_timestamp <= 0 or logical_timestamp > cutoff_ms:
+                continue
+            local = datetime.fromtimestamp(logical_timestamp / 1000.0, ZoneInfo("Asia/Shanghai"))
+            if local.strftime("%Y-%m-%d") != normalized_date:
+                continue
+            row["logical_timestamp"] = logical_timestamp
+            rows.append(row)
+        return IntradayFetchResult(
+            dataset="online_q2",
+            trade_date=normalized_date,
+            rows=rows,
+            source="production_online_q2",
+            notes=(
+                "Online Q2 was read from the q2 Redis view in a batch; legacy quotes and replay files are not fallbacks.",
+            ),
         )
 
     def load_runtime_cache_views(

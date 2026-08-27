@@ -13,9 +13,11 @@ from engine_next.runtime.plate_mapping_registry import (
     PLATE_MAPPING_S2P_KEY,
     build_plate_candidates_from_reason,
     choose_primary_plate,
+    collapse_runtime_primary_plate,
     decode_theme_list,
     is_generic_plate,
     merge_theme_lists,
+    normalize_plate_name,
     split_plate_tokens,
 )
 from engine_next.runtime.intraday_data_hub import IntradayDataHub, normalize_auction_pct_ratio
@@ -204,7 +206,42 @@ class IntradayContextBuilder:
                     tokens.append(cleaned)
             return tuple(tokens)
 
+        runtime_tokens = _usable_tokens(runtime_plate)
+        yest_tokens = _usable_tokens(yest_plate)
+        theme_tokens = tuple(
+            dict.fromkeys(
+                token
+                for theme in themes
+                for token in _usable_tokens(str(theme or ""))
+            )
+        )
         reason_tokens = tuple(build_plate_candidates_from_reason(reason=reason)) if reason else ()
+        runtime_primary = runtime_tokens[0] if runtime_tokens else ""
+        yest_primary = yest_tokens[0] if yest_tokens else ""
+
+        # Trust a stable runtime primary plate first, but keep a narrow correction
+        # gate when yesterday plate and hot-board signal align against it.
+        if runtime_primary and not is_generic_plate(runtime_primary):
+            runtime_family = collapse_runtime_primary_plate(runtime_primary)
+            yest_family = collapse_runtime_primary_plate(yest_primary)
+            hot_support_runtime = self._match_hot_plate_signal((runtime_primary,), hot_plate_map) if hot_plate_map else 0
+            hot_support_yest = self._match_hot_plate_signal((yest_primary,), hot_plate_map) if hot_plate_map and yest_primary else 0
+            if (
+                yest_primary
+                and not is_generic_plate(yest_primary)
+                and yest_family
+                and yest_family != runtime_family
+                and hot_support_yest > 0
+                and hot_support_runtime <= 0
+                and (
+                    yest_primary in theme_tokens
+                    or yest_primary in reason_tokens
+                    or yest_family in tuple(collapse_runtime_primary_plate(name) for name in theme_tokens)
+                )
+            ):
+                return yest_primary
+            return runtime_primary
+
         candidate_entries: list[tuple[str, int]] = []
 
         def _extend(values: tuple[str, ...], priority: int) -> None:
@@ -213,24 +250,28 @@ class IntradayContextBuilder:
                     continue
                 candidate_entries.append((value, priority))
 
-        _extend(_usable_tokens(yest_plate), 4)
-        _extend(reason_tokens, 3)
-        for theme in themes:
-            _extend(_usable_tokens(str(theme or "")), 2)
-        _extend(_usable_tokens(runtime_plate), 1)
+        _extend(yest_tokens, 4)
+        _extend(theme_tokens, 3)
+        _extend(reason_tokens, 2)
+        _extend(runtime_tokens, 1)
 
         theme_candidates = tuple(name for name, _ in candidate_entries)
-        fallback = str(yest_plate or reason_tokens[0] if reason_tokens else runtime_plate or next(iter(theme_candidates), "")).strip()
-        runtime_tokens = _usable_tokens(runtime_plate)
-        yest_tokens = _usable_tokens(yest_plate)
-        theme_front = tuple(dict.fromkeys(theme_candidates[:2]))
-        runtime_primary = runtime_tokens[0] if runtime_tokens else ""
-        yest_primary = yest_tokens[0] if yest_tokens else ""
-        if runtime_primary and runtime_primary in theme_front:
-            if yest_primary and yest_primary == runtime_primary:
-                return runtime_primary
-            if yest_primary and yest_primary not in theme_front and is_generic_plate(yest_primary):
-                return runtime_primary
+        fallback = str(
+            runtime_primary
+            or yest_primary
+            or (theme_tokens[0] if theme_tokens else "")
+            or (reason_tokens[0] if reason_tokens else "")
+            or next(iter(theme_candidates), "")
+        ).strip()
+
+        if yest_primary and not is_generic_plate(yest_primary):
+            if not theme_tokens and not reason_tokens:
+                return yest_primary
+            if yest_primary in theme_tokens or yest_primary in reason_tokens:
+                return yest_primary
+            if hot_plate_map and self._match_hot_plate_signal((yest_primary,), hot_plate_map) > 0:
+                return yest_primary
+
         preferred = [entry for entry in candidate_entries if not is_generic_plate(entry[0])]
         if hot_plate_map and preferred:
             ranked = sorted(
@@ -242,9 +283,7 @@ class IntradayContextBuilder:
                 ),
             )
             best_name, _ = ranked[0]
-            if self._match_hot_plate_signal((best_name,), hot_plate_map) > 0 and not (
-                yest_primary and not is_generic_plate(yest_primary)
-            ):
+            if self._match_hot_plate_signal((best_name,), hot_plate_map) > 0:
                 return best_name
         if preferred:
             ranked = sorted(
@@ -252,13 +291,71 @@ class IntradayContextBuilder:
                 key=lambda item: (
                     -item[1],
                     item[0] != yest_primary,
+                    item[0] != runtime_primary,
+                    item[0] != (theme_tokens[0] if theme_tokens else ""),
                     item[0] != (reason_tokens[0] if reason_tokens else ""),
-                    item[0] == runtime_primary,
                     item[0],
                 ),
             )
             return ranked[0][0]
         return choose_primary_plate(theme_candidates, fallback=fallback)
+
+    def _plate_resolution_notes(
+        self,
+        *,
+        resolved_plate: str,
+        runtime_plate: str,
+        yest_plate: str,
+        themes: Iterable[str] = (),
+        reason: str = "",
+    ) -> tuple[str, ...]:
+        runtime_clean = normalize_plate_name(runtime_plate)
+        yest_clean = normalize_plate_name(yest_plate)
+        resolved_clean = normalize_plate_name(resolved_plate)
+        theme_tokens = tuple(dict.fromkeys(split_plate_tokens(",".join(str(item or "") for item in themes if str(item or "").strip()))))
+        reason_tokens = tuple(build_plate_candidates_from_reason(reason=reason)) if reason else ()
+        notes: list[str] = []
+        if resolved_clean:
+            notes.append(f"plate_resolved={resolved_clean}")
+        sources: list[str] = []
+        if runtime_clean:
+            sources.append(f"runtime={runtime_clean}")
+        if yest_clean:
+            sources.append(f"yest={yest_clean}")
+        if theme_tokens:
+            sources.append(f"themes={'/'.join(theme_tokens[:3])}")
+        if reason_tokens:
+            sources.append(f"reason={'/'.join(reason_tokens[:3])}")
+        if sources:
+            notes.append("plate_sources|" + ";".join(sources))
+        source_families = {
+            collapse_runtime_primary_plate(runtime_clean) if runtime_clean else "",
+            collapse_runtime_primary_plate(yest_clean) if yest_clean else "",
+            *(collapse_runtime_primary_plate(name) for name in theme_tokens[:3]),
+            *(collapse_runtime_primary_plate(name) for name in reason_tokens[:3]),
+        }
+        normalized_families = tuple(name for name in source_families if name)
+        if len(set(normalized_families)) >= 2:
+            notes.append("plate_conflict=1")
+        return tuple(notes[:3])
+
+    def _plate_conflict_context_notes(self, snapshots: Iterable[StockStateSnapshot]) -> tuple[str, ...]:
+        conflict_samples: list[str] = []
+        conflict_count = 0
+        for snapshot in snapshots:
+            snapshot_notes = tuple(getattr(snapshot, "notes", ()) or ())
+            if "plate_conflict=1" not in snapshot_notes:
+                continue
+            conflict_count += 1
+            source_note = next((item for item in snapshot_notes if str(item).startswith("plate_sources|")), "")
+            if source_note and len(conflict_samples) < 5:
+                conflict_samples.append(f"{snapshot.symbol}:{snapshot.plate}|{source_note.removeprefix('plate_sources|')}")
+        if conflict_count <= 0:
+            return ()
+        notes = [f"plate_conflicts={conflict_count}"]
+        if conflict_samples:
+            notes.append("plate_conflict_samples=" + " ; ".join(conflict_samples))
+        return tuple(notes)
 
     @staticmethod
     def _parse_timestamp_ms(value: Any) -> int:
@@ -347,7 +444,7 @@ class IntradayContextBuilder:
         symbols = tuple(dict.fromkeys(_normalize_symbol(symbol) for symbol in request.symbols if _normalize_symbol(symbol)))
 
         if request.now is not None and request.now.strftime("%Y-%m-%d") == request.trade_date:
-            self._ensure_hot_rank_cache(request.trade_date, request.phase)
+            self._ensure_hot_rank_cache(request.trade_date, request.phase, now=request.now)
         quotes_result = self.hub.fetch_redis_quotes(symbols)
         cache_result = self.hub.load_runtime_cache_views(
             offline_context_date,
@@ -500,6 +597,13 @@ class IntradayContextBuilder:
                 reason=str(primed.stock_reason_map.get(symbol) or ""),
                 hot_plate_map=primed.effective_hot_plate_map,
             )
+            plate_notes = self._plate_resolution_notes(
+                resolved_plate=plate,
+                runtime_plate=str(primed.stock_plate_map.get(symbol) or ""),
+                yest_plate=str(yest.get("plate") or ""),
+                themes=theme_names,
+                reason=str(primed.stock_reason_map.get(symbol) or ""),
+            )
             market_cap_yi = self._to_yi(cache.get("real_market_cap"))
             amount_day_yi = self._to_yi(quote.get("amount"))
             speed_1m = float(quote.get("speed_1m", quote.get("change_rate_1min", 0.0)) or 0.0)
@@ -586,6 +690,7 @@ class IntradayContextBuilder:
                             *theme_names,
                         ),
                     ),
+                    notes=plate_notes,
                 )
             )
 
@@ -640,6 +745,7 @@ class IntradayContextBuilder:
 
         migrating_out_plates = [plate for plate, traj in sector_flow_trajectories.items() if traj.is_withdrawing]
         migrating_in_plates = [plate for plate, traj in sector_flow_trajectories.items() if traj.is_accelerating]
+        plate_conflict_notes = self._plate_conflict_context_notes(ranked_snapshots)
         
         # update market summary with migration data
         market_summary = type(market_summary)(
@@ -661,9 +767,12 @@ class IntradayContextBuilder:
             yesterday_hot_plate_map=primed.yesterday_hot_plate_map,
             yest_limit_map=primed.yest_limit_map,
             auction_map=auction_map,
+            latest_quote_timestamp_ms=primed.latest_quote_timestamp_ms,
+            latest_quote_time=primed.latest_quote_time,
+            latest_quote_age_seconds=primed.latest_quote_age_seconds,
             cached_theme_conclusions=cached_conclusions,
             sector_flow_trajectories=sector_flow_trajectories,
-            notes=primed.notes,
+            notes=(*primed.notes, *plate_conflict_notes),
         )
 
     def _load_auction_rows(self, request: IntradayContextRequest, symbols: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -775,7 +884,13 @@ class IntradayContextBuilder:
         payload = self._load_json_string(f"cache:hot_rank_meta:{trade_date}")
         return payload if isinstance(payload, dict) else {}
 
-    def _ensure_hot_rank_cache(self, trade_date: str, phase: RunPhase) -> None:
+    def _ensure_hot_rank_cache(
+        self,
+        trade_date: str,
+        phase: RunPhase,
+        *,
+        now: datetime | None = None,
+    ) -> None:
         if phase not in (RunPhase.PREMARKET, RunPhase.AUCTION, RunPhase.INTRADAY):
             return
         redis_key = f"cache:hot_rank:{trade_date}"
@@ -785,11 +900,16 @@ class IntradayContextBuilder:
             updated_at_ts = int(float(meta.get("updated_at_ts", 0) or 0))
         except (TypeError, ValueError):
             updated_at_ts = 0
-        age_seconds = max(int(datetime.now().timestamp()) - updated_at_ts, 0) if updated_at_ts > 0 else None
+        reference_now = now or datetime.now()
+        age_seconds = max(int(reference_now.timestamp()) - updated_at_ts, 0) if updated_at_ts > 0 else None
         has_cache = bool(self.hub.redis.hlen(redis_key) or 0)
         is_fresh = bool(has_cache and age_seconds is not None and age_seconds <= stale_limit_seconds)
         if is_fresh:
             return
+        if bool(getattr(self.hub.redis, "replay_read_only", False)):
+            raise RuntimeError(
+                "replay hot-rank fixture is missing or stale; external refresh is disabled"
+            )
         try:
             self.hub.fetch_hot_rank(trade_date, phase, top_n=200)
         except Exception:
@@ -877,6 +997,10 @@ class IntradayContextBuilder:
             "yest_limit_signature": yest_limit_signature,
             "auction_signature": auction_signature,
         }
+        if bool(getattr(self.hub.redis, "replay_read_only", False)):
+            self._string_key_cache[self._session_facts_cache_key(trade_date, phase)] = payload
+            self._string_key_cache[self._session_facts_meta_key(trade_date, phase)] = meta
+            return
         self.hub.redis.set(
             self._session_facts_cache_key(trade_date, phase),
             json.dumps(payload, ensure_ascii=False),

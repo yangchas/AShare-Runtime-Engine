@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import logging
 from typing import Iterable
 
 from engine_next.domain.models import (
@@ -10,9 +11,11 @@ from engine_next.domain.models import (
     StockSelectionContext,
     ThemeSelectionContext,
 )
+from engine_next.domain.decision_models import DecisionBundle, MarketTranslationSummary
 from engine_next.runtime.intraday_data_hub import IntradayDataHub
-from engine_next.strategy_skill_layer.auction_and_ladder import build_auction_and_ladder_decision
-from engine_next.strategy_skill_layer.opening_validation_hub import match_opening_validation
+from engine_next.strategy_skill_layer.hypothesis_engine import build_hypothesis_decision_bundle
+from engine_next.strategy_skill_layer.local_decision_layer import build_local_decision_bundle
+from engine_next.strategy_skill_layer.relative_amount import enrich_snapshot_amount_rank_pcts
 from engine_next.strategy_skill_layer.shape_engine import (
     build_stock_selection_context,
     build_theme_context_map,
@@ -24,7 +27,8 @@ from engine_next.strategy_skill_layer.slice_comparison import (
     topn_expansion_factor,
 )
 from engine_next.strategy_skill_layer.stock_profile import assess_stock_profile
-from engine_next.strategy_skill_layer.trade_conclusion_gate import stock_passes_conclusion_gate
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -35,6 +39,7 @@ class ContextStrategyBundle:
     stock_selection_contexts: tuple[StockSelectionContext, ...]
     decisions: tuple[AuctionLadderDecision, ...]
     focus_symbols: tuple[str, ...]
+    decision_bundle: DecisionBundle | None = None
     notes: tuple[str, ...] = ()
 
 
@@ -46,17 +51,425 @@ class _CachedStockSelectionEntry:
 
 _STOCK_SELECTION_CACHE: dict[tuple[str, str], _CachedStockSelectionEntry] = {}
 _THEME_CONCLUSION_CACHE_TTL_SECONDS = 300
+_FUNNEL_TRACE_LOG_LIMIT = 20
 
 
-@dataclass(frozen=True)
-class _RelativeStrengthProfile:
-    amount_2m_top: frozenset[str]
-    amount_ratio_2m_top: frozenset[str]
-    open_undertake_top: frozenset[str]
-    execution_quality_top: frozenset[str]
-    shape_quality_top: frozenset[str]
-    turnover_quality_top: frozenset[str]
-    theme_core_top: frozenset[str]
+def build_empty_funnel_summary() -> dict[str, object]:
+    return {
+        "raw": 0,
+        "shape": 0,
+        "local": 0,
+        "global": 0,
+        "executable": 0,
+        "profit_center": 0,
+        "backup_watch": 0,
+        "blocked": 0,
+        "invalidated": 0,
+        "blocked_by_theme": 0,
+        "blocked_by_buy_point": 0,
+        "blocked_by_data": 0,
+        "controller_downgrade": 0,
+        "why_no_profit_center": "unknown",
+    }
+
+
+def _derive_why_no_profit_center(summary: dict[str, object]) -> str:
+    def _num(key: str) -> int:
+        try:
+            return int(float(summary.get(key, 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    if _num("raw") == 0:
+        return "no_candidate"
+    if _num("local") == 0:
+        return "no_local_signal"
+    if _num("blocked_by_data") > 0 and _num("executable") == 0:
+        return "quote_stale_block_live_trade"
+    if _num("blocked_by_theme") > 0 and _num("global") == 0:
+        return "theme_not_tradeable"
+    if _num("blocked_by_buy_point") > 0 and _num("executable") == 0:
+        return "buy_point_not_confirmed"
+    if _num("controller_downgrade") > 0 and _num("profit_center") == 0:
+        return "controller_downgraded"
+    if _num("profit_center") == 0:
+        return "unknown"
+    return ""
+
+
+def _finalize_funnel_summary(
+    decision_bundle: DecisionBundle | None,
+    *,
+    context: IntradayContext,
+    raw_count: int,
+    shape_count: int,
+) -> DecisionBundle | None:
+    if decision_bundle is None:
+        return None
+    summary = build_empty_funnel_summary()
+    summary.update(dict(getattr(decision_bundle, "funnel_summary", {}) or {}))
+    summary["raw"] = int(raw_count)
+    summary["shape"] = int(shape_count)
+    if int(summary.get("global", 0) or 0) <= 0:
+        summary["global"] = len(tuple(getattr(decision_bundle, "final_candidates", ()) or ()))
+    if int(summary.get("profit_center", 0) or 0) <= 0:
+        slice_obj = getattr(decision_bundle, "playbook_candidate_slice", None)
+        if slice_obj is not None:
+            summary["profit_center"] = len(tuple(getattr(slice_obj, "primary", ()) or ()))
+            summary["backup_watch"] = len(tuple(getattr(slice_obj, "watch", ()) or ())) + len(tuple(getattr(slice_obj, "inactive", ()) or ()))
+            summary["blocked"] = len(tuple(getattr(slice_obj, "blocked", ()) or ()))
+            summary["executable"] = len(tuple(getattr(slice_obj, "primary", ()) or ()))
+    summary["why_no_profit_center"] = _derive_why_no_profit_center(summary) or ""
+    updated_bundle = replace(
+        decision_bundle,
+        funnel_summary=summary,
+        funnel_traces=_enrich_funnel_trace_names(
+            context,
+            traces=tuple(getattr(decision_bundle, "funnel_traces", ()) or ()),
+        ),
+    )
+    return replace(
+        updated_bundle,
+        market_translation_summary=_build_market_translation_summary(updated_bundle),
+    )
+
+
+def _format_funnel_summary(summary: dict[str, object]) -> str:
+    return (
+        f"raw={summary.get('raw', 0)} | shape={summary.get('shape', 0)} | "
+        f"local={summary.get('local', 0)} | global={summary.get('global', 0)} | "
+        f"executable={summary.get('executable', 0)} | profit_center={summary.get('profit_center', 0)} | "
+        f"backup={summary.get('backup_watch', 0)} | blocked={summary.get('blocked', 0)} | "
+        f"invalidated={summary.get('invalidated', 0)} | blocked_theme={summary.get('blocked_by_theme', 0)} | "
+        f"blocked_buy_point={summary.get('blocked_by_buy_point', 0)} | blocked_data={summary.get('blocked_by_data', 0)} | "
+        f"controller_downgrade={summary.get('controller_downgrade', 0)} | "
+        f"why_no_profit_center={summary.get('why_no_profit_center', 'unknown') or 'none'}"
+    )
+
+
+def _summary_int(summary: dict[str, object], key: str, default: int = 0) -> int:
+    try:
+        return int(float(summary.get(key, default) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _theme_name_from_signal(signal: object) -> str:
+    return str(getattr(signal, "theme", "") or "").strip()
+
+
+def _build_market_translation_summary(decision_bundle: DecisionBundle | None) -> MarketTranslationSummary | None:
+    """Translate existing migration/funnel facts into operator-facing market language.
+
+    This summary is explanatory only. It must not affect candidate buckets, ranking, actions, or caps.
+    """
+
+    if decision_bundle is None:
+        return None
+    signals = tuple(getattr(decision_bundle, "market_migration_signals", ()) or ())
+    summary = dict(getattr(decision_bundle, "funnel_summary", {}) or {})
+    if not signals and not summary:
+        return None
+
+    executable = _summary_int(summary, "executable")
+    profit_center = _summary_int(summary, "profit_center")
+    backup = _summary_int(summary, "backup_watch")
+    blocked_buy_point = _summary_int(summary, "blocked_by_buy_point")
+    local = _summary_int(summary, "local")
+
+    watch_themes: list[str] = []
+    cashout_themes: list[str] = []
+    risk_themes: list[str] = []
+    evidence: list[str] = []
+    validation_by_theme = {
+        str(getattr(item, "theme", "") or ""): str(getattr(item, "validation_state", "") or "")
+        for item in tuple(getattr(decision_bundle, "mainline_validation_states", ()) or ())
+        if str(getattr(item, "theme", "") or "")
+    }
+
+    for signal in signals[:8]:
+        theme = _theme_name_from_signal(signal)
+        if not theme:
+            continue
+        money_state = str(getattr(signal, "money_state", "") or "")
+        validation_state = validation_by_theme.get(theme, "")
+        rank = int(getattr(signal, "rank", 999) or 999)
+        change_pct = float(getattr(signal, "change_pct", 0.0) or 0.0)
+        net_inflow_yi = float(getattr(signal, "net_inflow_yi", 0.0) or 0.0)
+        evidence_axes = tuple(getattr(signal, "evidence_axes", ()) or ())
+
+        hot_but_pressure = (
+            rank <= 5
+            and (net_inflow_yi <= -20.0 or change_pct <= -1.0)
+            and money_state in {"money_in", "money_rotation_in", "attention_only", "money_out", "fake_hot"}
+        )
+        if hot_but_pressure:
+            cashout_themes.append(theme)
+            evidence.append(f"{theme}=热度{rank}/流向{net_inflow_yi:.1f}亿/涨跌{change_pct:.1f}%")
+            continue
+        if money_state in {"money_out", "fake_hot"}:
+            risk_themes.append(theme)
+            evidence.append(f"{theme}={money_state}")
+            continue
+        if money_state == "style_risk_line":
+            risk_themes.append(theme)
+            evidence.append(f"{theme}=风格风险线")
+            continue
+        if money_state in {"money_in", "money_rotation_in"}:
+            if validation_state in {"auction_candidate", "open_watch"}:
+                watch_themes.append(f"{theme}(待验证)")
+            else:
+                watch_themes.append(theme)
+            if len(evidence_axes) >= 3:
+                evidence.append(f"{theme}={money_state}/{validation_state}")
+        elif money_state == "attention_only":
+            risk_themes.append(f"{theme}(仅热度)")
+
+    has_buy_point_block = blocked_buy_point >= max(20, local // 2 if local else 20)
+    if profit_center > 0 or executable > 0:
+        market_mode = "开盘验证候选"
+    elif cashout_themes and watch_themes and has_buy_point_block:
+        market_mode = "低位试错/热板兑现"
+    elif cashout_themes and has_buy_point_block:
+        market_mode = "热板兑现观察"
+    elif watch_themes and has_buy_point_block:
+        market_mode = "低位试错"
+    elif risk_themes and not watch_themes:
+        market_mode = "防守观察"
+    else:
+        market_mode = "轮动观察"
+
+    if has_buy_point_block and watch_themes:
+        profit_style = "有方向无确认买点"
+    elif cashout_themes:
+        profit_style = "热板承压兑现"
+    elif executable > 0:
+        profit_style = "前排确认候选"
+    elif backup > 0:
+        profit_style = "等待前排换手"
+    else:
+        profit_style = "无明确赚钱方式"
+
+    mainline_text = "-"
+    if watch_themes:
+        mainline_text = " / ".join(dict.fromkeys(watch_themes[:3]))
+    elif cashout_themes:
+        mainline_text = f"{cashout_themes[0]}承压"
+    elif risk_themes:
+        mainline_text = "风险优先"
+
+    if has_buy_point_block:
+        evidence.append(f"买点未确认={blocked_buy_point}")
+    if executable == 0 and local > 0:
+        evidence.append("有候选但无可执行买点")
+
+    return MarketTranslationSummary(
+        market_mode=market_mode,
+        profit_style=profit_style,
+        mainline_text=mainline_text,
+        watch_themes=tuple(dict.fromkeys(watch_themes)),
+        cashout_themes=tuple(dict.fromkeys(cashout_themes)),
+        risk_themes=tuple(dict.fromkeys(risk_themes)),
+        evidence=tuple(dict.fromkeys(evidence)),
+    )
+
+
+def _format_funnel_trace(trace: dict[str, object]) -> str:
+    symbol = str(trace.get("symbol", "") or "unknown")
+    name = str(trace.get("name", "") or "unknown")
+    theme = str(trace.get("theme", "") or "unknown")
+    source = ",".join(str(item) for item in tuple(trace.get("source", []) or []) if str(item)) or "unknown"
+    buy_point = str(trace.get("buy_point", "") or "unknown")
+    status = str(trace.get("pass_or_block", "") or "unknown")
+    reason = ",".join(str(item) for item in tuple(trace.get("reason", []) or []) if str(item)) or "unknown"
+    metrics = trace.get("key_metrics", {})
+    if isinstance(metrics, dict):
+        metric_text = ",".join(f"{key}:{value}" for key, value in list(metrics.items())[:5]) or "-"
+    else:
+        metric_text = "-"
+    return (
+        f"{symbol} | name={name} | theme={theme} | source={source} | "
+        f"buy_point={buy_point} | status={status} | reason={reason} | metrics={metric_text}"
+    )
+
+
+def _format_migration_shadow(signal: object, validation: object | None) -> str:
+    theme = str(getattr(signal, "theme", "") or "-")
+    tags = ",".join(str(item) for item in tuple(getattr(signal, "money_tags", ()) or ()) if str(item)) or "-"
+    axes = ",".join(str(item) for item in tuple(getattr(signal, "evidence_axes", ()) or ()) if str(item)) or "-"
+    validation_state = str(getattr(validation, "validation_state", "") or "-") if validation is not None else "-"
+    invalidations = (
+        ",".join(str(item) for item in tuple(getattr(validation, "invalidations", ()) or ()) if str(item))
+        if validation is not None
+        else ""
+    ) or "-"
+    phase = str(getattr(validation, "phase", "") or "-") if validation is not None else "-"
+    return (
+        f"phase={phase} | theme={theme} | rank={getattr(signal, 'rank', 999)} | "
+        f"rank_delta_prev={getattr(signal, 'rank_delta_prev', 0)} | "
+        f"rank_delta_5m={getattr(signal, 'rank_delta_5m', 0)} | "
+        f"rank_delta_yday={getattr(signal, 'rank_delta_yday', 0)} | "
+        f"strength={float(getattr(signal, 'strength', 0.0) or 0.0):.2f} | "
+        f"change_pct={float(getattr(signal, 'change_pct', 0.0) or 0.0):.3f} | "
+        f"net_inflow_yi={float(getattr(signal, 'net_inflow_yi', 0.0) or 0.0):.2f} | "
+        f"net_inflow_yi_delta_prev={float(getattr(signal, 'net_inflow_yi_delta_prev', 0.0) or 0.0):.2f} | "
+        f"net_inflow_yi_delta_5m={float(getattr(signal, 'net_inflow_yi_delta_5m', 0.0) or 0.0):.2f} | "
+        f"net_inflow_yi_delta_yday={float(getattr(signal, 'net_inflow_yi_delta_yday', 0.0) or 0.0):.2f} | "
+        f"money_state={str(getattr(signal, 'money_state', '') or 'unknown')} | "
+        f"money_tags={tags} | validation_state={validation_state} | evidence_axes={axes} | "
+        f"source_freshness={str(getattr(signal, 'source_freshness', '') or 'unknown')} | "
+        f"confidence={str(getattr(signal, 'confidence', '') or 'low')} | invalidations={invalidations}"
+    )
+
+
+def _format_stable_trading_plan(plan: object) -> str:
+    money_to = ",".join(str(item) for item in tuple(getattr(plan, "money_to", ()) or ()) if str(item)) or "-"
+    money_from = ",".join(str(item) for item in tuple(getattr(plan, "money_from", ()) or ()) if str(item)) or "-"
+    risk_or_noise = ",".join(str(item) for item in tuple(getattr(plan, "risk_or_noise", ()) or ()) if str(item)) or "-"
+    money_to_metrics = ";".join(str(item) for item in tuple(getattr(plan, "money_to_metrics", ()) or ()) if str(item)) or "-"
+    money_from_metrics = ";".join(str(item) for item in tuple(getattr(plan, "money_from_metrics", ()) or ()) if str(item)) or "-"
+    risk_or_noise_metrics = ";".join(str(item) for item in tuple(getattr(plan, "risk_or_noise_metrics", ()) or ()) if str(item)) or "-"
+    tactic_reason = ",".join(str(item) for item in tuple(getattr(plan, "tactic_reason", ()) or ()) if str(item)) or "-"
+    confirm = ",".join(str(item) for item in tuple(getattr(plan, "confirm_conditions", ()) or ()) if str(item)) or "-"
+    invalidation = ",".join(str(item) for item in tuple(getattr(plan, "invalidation_points", ()) or ()) if str(item)) or "-"
+    candidates = ",".join(str(getattr(item, "symbol", "") or "") for item in tuple(getattr(plan, "candidates", ()) or ()) if str(getattr(item, "symbol", "") or "")) or "-"
+    return (
+        f"phase={str(getattr(plan, 'phase', '') or 'unknown')} | "
+        f"money_to={money_to} | money_to_metrics={money_to_metrics} | "
+        f"money_from={money_from} | money_from_metrics={money_from_metrics} | "
+        f"risk_or_noise={risk_or_noise} | risk_or_noise_metrics={risk_or_noise_metrics} | "
+        f"best_tactic={str(getattr(plan, 'best_tactic', '') or 'watch_only')} | "
+        f"tactic_reason={tactic_reason} | candidates={candidates} | "
+        f"confirm={confirm} | invalidation={invalidation} | "
+        f"why_no_candidate={str(getattr(plan, 'why_no_candidate', '') or '-')}"
+    )
+
+
+def _format_stable_trading_candidate(candidate: object) -> str:
+    confirm = ",".join(str(item) for item in tuple(getattr(candidate, "confirm_condition", ()) or ()) if str(item)) or "-"
+    invalidation = ",".join(str(item) for item in tuple(getattr(candidate, "invalidation_points", ()) or ()) if str(item)) or "-"
+    evidence = ",".join(str(item) for item in tuple(getattr(candidate, "evidence_summary", ()) or ()) if str(item)) or "-"
+    return (
+        f"{str(getattr(candidate, 'symbol', '') or '-')} | "
+        f"theme={str(getattr(candidate, 'theme_name', '') or '-')} | "
+        f"bucket={str(getattr(candidate, 'source_bucket', '') or '-')} | "
+        f"state={str(getattr(candidate, 'candidate_state', '') or 'watch_only')} | "
+        f"strategy={str(getattr(candidate, 'strategy_id', '') or '-')} | "
+        f"buy_point={str(getattr(candidate, 'buy_point', '') or 'unknown')} | "
+        f"role={str(getattr(candidate, 'role', '') or 'unknown')} | "
+        f"score={float(getattr(candidate, 'setup_score', 0.0) or 0.0):.2f} | "
+        f"confirm={confirm} | invalidation={invalidation} | evidence={evidence}"
+    )
+
+
+def _format_theme_process_board(board: object) -> str:
+    summary = ";".join(str(item) for item in tuple(getattr(board, "process_summary", ()) or ()) if str(item)) or "-"
+    return (
+        f"main={str(getattr(board, 'current_mainline', '') or '-')} | "
+        f"recheck={1 if bool(getattr(board, 'recheck_required', False)) else 0} | "
+        f"focus={str(getattr(board, 'execution_focus_candidate', '') or '-')} | "
+        f"reason={str(getattr(board, 'recheck_reason', '') or '-')} | "
+        f"rows={summary}"
+    )
+
+
+def _format_theme_process_row(row: object) -> str:
+    candidates = ",".join(str(item) for item in tuple(getattr(row, "top_candidates", ()) or ()) if str(item)) or "-"
+    axes = ",".join(str(item) for item in tuple(getattr(row, "evidence_axes", ()) or ()) if str(item)) or "-"
+    invalidation = ",".join(str(item) for item in tuple(getattr(row, "invalidation_points", ()) or ())[:3] if str(item)) or "-"
+    votes = ",".join(
+        f"{str(getattr(vote, 'strategy_id', '') or '-')}:{int(getattr(vote, 'count', 0) or 0)}"
+        for vote in tuple(getattr(row, "strategy_votes", ()) or ())[:4]
+    ) or "-"
+    return (
+        f"theme={str(getattr(row, 'theme', '') or '-')} | "
+        f"hot_rank={int(getattr(row, 'hot_rank', 999) or 999)} | "
+        f"money_state={str(getattr(row, 'money_state', '') or 'unknown')} | "
+        f"validation={str(getattr(row, 'validation_state', '') or 'unknown')} | "
+        f"flow={float(getattr(row, 'net_inflow_yi', 0.0) or 0.0):.2f} | "
+        f"amount_2m={float(getattr(row, 'amount_2m_sum', 0.0) or 0.0):.0f} | "
+        f"front_2m={int(getattr(row, 'front_2m_count', 0) or 0)} | "
+        f"strong_weak={float(getattr(row, 'strong_weak_ratio', 0.0) or 0.0):.2f} | "
+        f"local={int(getattr(row, 'local_candidate_count', 0) or 0)} | "
+        f"best_strategy={str(getattr(row, 'best_strategy', '') or '-')} | "
+        f"votes={votes} | candidates={candidates} | "
+        f"process={str(getattr(row, 'process_state', '') or 'unknown')} | "
+        f"opportunity={str(getattr(row, 'opportunity_tag', '') or 'observe')} | "
+        f"axes={axes} | "
+        f"state={str(getattr(row, 'state_label', '') or 'unknown')} | "
+        f"action={str(getattr(row, 'action_hint', '') or 'observe')} | "
+        f"invalidation={invalidation} | "
+        f"reject={str(getattr(row, 'reject_reason', '') or '-')} | "
+        f"mismatch={str(getattr(row, 'mismatch_reason', '') or '-')}"
+    )
+
+
+def _enrich_funnel_trace_names(
+    context: IntradayContext,
+    traces: tuple[dict[str, object], ...],
+) -> tuple[dict[str, object], ...]:
+    if not traces:
+        return ()
+    name_map = {
+        str(getattr(snapshot, "symbol", "") or ""): str(getattr(snapshot, "name", "") or "")
+        for snapshot in tuple(getattr(context, "stock_snapshots", ()) or ())
+        if str(getattr(snapshot, "symbol", "") or "")
+    }
+    enriched: list[dict[str, object]] = []
+    for trace in traces:
+        if not isinstance(trace, dict):
+            continue
+        symbol = str(trace.get("symbol", "") or "")
+        name = str(trace.get("name", "") or "")
+        if symbol and (not name or name == "unknown"):
+            resolved_name = name_map.get(symbol, "")
+            if resolved_name:
+                updated = dict(trace)
+                updated["name"] = resolved_name
+                enriched.append(updated)
+                continue
+        enriched.append(trace)
+    return tuple(enriched)
+
+
+def _log_funnel_debug(
+    decision_bundle: DecisionBundle | None,
+    *,
+    raw_count: int = 0,
+    shape_count: int = 0,
+) -> None:
+    if decision_bundle is None:
+        summary = build_empty_funnel_summary()
+        summary["raw"] = int(raw_count)
+        summary["shape"] = int(shape_count)
+        summary["why_no_profit_center"] = _derive_why_no_profit_center(summary)
+        logger.info("funnel.summary | %s", _format_funnel_summary(summary))
+        return
+    summary = dict(getattr(decision_bundle, "funnel_summary", {}) or build_empty_funnel_summary())
+    logger.info("funnel.summary | %s", _format_funnel_summary(summary))
+    for trace in tuple(getattr(decision_bundle, "funnel_traces", ()) or ())[:_FUNNEL_TRACE_LOG_LIMIT]:
+        if isinstance(trace, dict):
+            logger.info("funnel.trace | %s", _format_funnel_trace(trace))
+    validations = {
+        str(getattr(item, "theme", "") or ""): item
+        for item in tuple(getattr(decision_bundle, "mainline_validation_states", ()) or ())
+        if str(getattr(item, "theme", "") or "")
+    }
+    for signal in tuple(getattr(decision_bundle, "market_migration_signals", ()) or ())[:8]:
+        logger.info(
+            "hot_board.migration_shadow | %s",
+            _format_migration_shadow(signal, validations.get(str(getattr(signal, "theme", "") or ""))),
+        )
+    stable_plan = getattr(decision_bundle, "stable_trading_plan", None)
+    if stable_plan is not None:
+        logger.info("stable_trade.plan | %s", _format_stable_trading_plan(stable_plan))
+        for candidate in tuple(getattr(stable_plan, "candidates", ()) or ())[:3]:
+            logger.info("stable_trade.candidate | %s", _format_stable_trading_candidate(candidate))
+    theme_process_board = getattr(decision_bundle, "theme_process_board", None)
+    if theme_process_board is not None:
+        logger.info("theme_process.board | %s", _format_theme_process_board(theme_process_board))
+        for row in tuple(getattr(theme_process_board, "rows", ()) or ())[:6]:
+            logger.info("theme_process.row | %s", _format_theme_process_row(row))
 
 
 def _decision_action_priority(action: str) -> int:
@@ -68,6 +481,18 @@ def _decision_action_priority(action: str) -> int:
         "leader_watch": 2,
         "front_row_watch": 1,
         "n_rebound": 1,
+    }
+    return priority_map.get(str(action or ""), 0)
+
+
+def _local_candidate_action_priority(action: str) -> int:
+    priority_map = {
+        "probe": 4,
+        "shadow_can_rank": 3,
+        "watch": 2,
+        "avoid_chase": 1,
+        "avoid": 0,
+        "disabled": 0,
     }
     return priority_map.get(str(action or ""), 0)
 
@@ -99,37 +524,26 @@ def _enrich_stock_relative_rank_pcts(
         theme_symbols = grouped_symbols.get(selection.plate_name or "", [])
         amount_pairs: list[tuple[str, float]] = []
         amount_ratio_pairs: list[tuple[str, float]] = []
-        execution_pairs: list[tuple[str, float]] = []
-        shape_pairs: list[tuple[str, float]] = []
         for symbol in theme_symbols:
             snapshot = snapshot_map.get(symbol)
-            matched = selection_map.get(symbol)
-            if snapshot is None or matched is None:
+            if snapshot is None:
                 continue
             auction_amount = float(getattr(snapshot, "auction_amount", 0.0) or 0.0)
             amount_2m = float(getattr(snapshot, "amount_2m", 0.0) or 0.0)
             amount_pairs.append((symbol, amount_2m))
             amount_ratio_pairs.append((symbol, (amount_2m / auction_amount) if auction_amount > 0 else 0.0))
-            execution_pairs.append((symbol, float(matched.execution_quality_score or 0.0)))
-            shape_pairs.append((symbol, float(matched.shape_quality_score or 0.0)))
         amount_rank_pct = _rank_pct_desc(amount_pairs)
         amount_ratio_rank_pct = _rank_pct_desc(amount_ratio_pairs)
-        execution_rank_pct = _rank_pct_desc(execution_pairs)
-        shape_rank_pct = _rank_pct_desc(shape_pairs)
         enriched.append(
             replace(
                 selection,
                 stock_amount_2m_rank_in_theme_pct=float(amount_rank_pct.get(selection.symbol, 1.0)),
                 stock_amount_ratio_2m_rank_in_theme_pct=float(amount_ratio_rank_pct.get(selection.symbol, 1.0)),
-                stock_execution_rank_in_theme_pct=float(execution_rank_pct.get(selection.symbol, 1.0)),
-                stock_shape_rank_in_theme_pct=float(shape_rank_pct.get(selection.symbol, 1.0)),
                 notes=tuple(
                     list(selection.notes)
                     + [
                         f"amount_2m_rank_pct={float(amount_rank_pct.get(selection.symbol, 1.0)):.3f}",
                         f"amount_ratio_2m_rank_pct={float(amount_ratio_rank_pct.get(selection.symbol, 1.0)):.3f}",
-                        f"execution_rank_pct={float(execution_rank_pct.get(selection.symbol, 1.0)):.3f}",
-                        f"shape_rank_pct={float(shape_rank_pct.get(selection.symbol, 1.0)):.3f}",
                         f"daily_height={selection.daily_height_bucket}",
                     ]
                 ),
@@ -214,6 +628,9 @@ def build_context_strategy_bundle_for_symbols(
     symbols: Iterable[str] | None,
     theme_context_map: dict[str, ThemeSelectionContext] | None = None,
 ) -> ContextStrategyBundle:
+    enriched_snapshots = enrich_snapshot_amount_rank_pcts(context.stock_snapshots)
+    if enriched_snapshots is not context.stock_snapshots:
+        context = replace(context, stock_snapshots=enriched_snapshots)
     symbol_filter = {str(symbol) for symbol in symbols or () if str(symbol)}
     total_snapshot_count = len(context.stock_snapshots)
     if symbol_filter:
@@ -255,46 +672,116 @@ def build_context_strategy_bundle_for_symbols(
         selected_snapshots,
         tuple(stock_selection_context_list),
     )
-    decisions = tuple(
-        build_auction_and_ladder_decision(
-            snapshot,
-            profile=profile,
-            stock_selection=selection,
-            theme_selection=resolved_theme_context_map.get(selection.plate_name),
-            market_summary=context.market_summary,
+    decision_bundle: DecisionBundle | None = None
+    decision_notes: tuple[str, ...] = ()
+    try:
+        decision_bundle = build_local_decision_bundle(
+            context,
+            selection_contexts=stock_selection_contexts,
         )
-        for snapshot, profile, selection in zip(selected_snapshots, profiles, stock_selection_contexts)
-    )
-
-    pre_rank_bundle = ContextStrategyBundle(
+        decision_bundle = build_hypothesis_decision_bundle(context, decision_bundle)
+        playbook_matrix = decision_bundle.playbook_control_matrix
+        decision_notes = (
+            tuple(f"local_decision_{note}" for note in decision_bundle.notes)
+            + (
+                f"playbook_final_candidates={len(decision_bundle.final_candidates)}",
+                f"playbook_global_script={decision_bundle.global_decision.market_script if decision_bundle.global_decision is not None else 'missing'}",
+                f"playbook_main_theme={decision_bundle.global_decision.main_attack_theme if decision_bundle.global_decision is not None else '-'}",
+                f"playbook_battlefield={decision_bundle.temporal_migration_decision.main_battlefield_theme if decision_bundle.temporal_migration_decision is not None else '-'}",
+                f"playbook_battlefield_state={decision_bundle.temporal_migration_decision.battlefield_state if decision_bundle.temporal_migration_decision is not None else '-'}",
+                f"playbook_handoff={(decision_bundle.temporal_migration_decision.handoff_from if decision_bundle.temporal_migration_decision is not None else '-') + '->' + (decision_bundle.temporal_migration_decision.handoff_to if decision_bundle.temporal_migration_decision is not None else '-')}",
+                f"playbook_active={','.join(playbook_matrix.active_playbooks) if playbook_matrix is not None and playbook_matrix.active_playbooks else '-'}",
+                f"playbook_blocked={','.join(playbook_matrix.blocked_playbooks) if playbook_matrix is not None and playbook_matrix.blocked_playbooks else '-'}",
+            )
+        )
+    except Exception as exc:
+        logger.exception(
+            "context pipeline decision bundle failed | trade_date=%s | phase=%s | selected=%s",
+            getattr(context, "trade_date", ""),
+            getattr(getattr(context, "phase", None), "value", getattr(context, "phase", "")),
+            len(selected_snapshots),
+        )
+        decision_bundle = None
+        decision_notes = (f"local_decision_error={type(exc).__name__}",)
+    decision_bundle = _finalize_funnel_summary(
+        decision_bundle,
         context=context,
-        profiles=profiles,
-        theme_context_map=resolved_theme_context_map,
-        stock_selection_contexts=stock_selection_contexts,
-        decisions=decisions,
-        focus_symbols=(),
-        notes=(),
+        raw_count=selected_snapshot_count,
+        shape_count=len(stock_selection_contexts),
     )
-    upgraded_bundle = _upgrade_bundle_decisions_by_opening_validation(pre_rank_bundle)
-    upgraded_decisions = upgraded_bundle.decisions
-
-    ranked = sorted(
-        zip(upgraded_decisions, stock_selection_contexts),
-        key=lambda pair: (
-            pair[1].theme_tradable,
-            _decision_action_priority(pair[0].action),
-            pair[1].is_true_leader,
-            pair[1].is_front_row,
-            pair[0].confidence,
-            -pair[1].hot_rank,
-            pair[1].is_active_pool,
-            pair[0].risk_reward_ratio,
+    _log_funnel_debug(
+        decision_bundle,
+        raw_count=selected_snapshot_count,
+        shape_count=len(stock_selection_contexts),
+    )
+    final_candidate_rank = {
+        item.symbol: item
+        for item in (decision_bundle.final_candidates if decision_bundle is not None else ())
+    }
+    profile_map = {profile.symbol: profile for profile in profiles}
+    seeded_decisions: list[AuctionLadderDecision] = []
+    missing_profile_count = 0
+    for final_candidate in sorted(
+        tuple(final_candidate_rank.values()),
+        key=lambda item: (
+            _local_candidate_action_priority(str(getattr(item, "action", "") or "")),
+            int(getattr(item, "priority_rank", 999) or 999) * -1,
         ),
         reverse=True,
+    ):
+        symbol = str(getattr(final_candidate, "symbol", "") or "")
+        if not symbol:
+            continue
+        profile = profile_map.get(symbol)
+        if profile is None:
+            missing_profile_count += 1
+            continue
+        raw_action = str(getattr(final_candidate, "action", "") or "")
+        risk_level = str(getattr(final_candidate, "risk_level", "") or "")
+        if raw_action in {"avoid", "avoid_chase", "disabled"} or risk_level == "high":
+            continue
+        mapped_action = "small_probe_only" if raw_action == "probe" else "observe_only"
+        priority_rank = int(getattr(final_candidate, "priority_rank", 999) or 999)
+        confidence = max(52, min(95, 100 - priority_rank))
+        if mapped_action == "observe_only":
+            confidence = min(confidence, 65)
+        seeded_decisions.append(
+            AuctionLadderDecision(
+                symbol=symbol,
+                setup_id=f"playbook_{str(getattr(final_candidate, 'playbook', '') or 'watch')}",
+                action=mapped_action,
+                confidence=confidence,
+                kelly_position_pct=0.10 if mapped_action == "small_probe_only" else 0.0,
+                risk_reward_ratio=1.6 if mapped_action == "small_probe_only" else 1.0,
+                profile=profile,
+                reasons=(
+                    f"final_candidate={raw_action}",
+                    f"path={str(getattr(final_candidate, 'path_type', '') or '-')}",
+                    f"rank={priority_rank}",
+                ),
+            )
+        )
+    ranked_decisions = tuple(seeded_decisions)
+    logger.info(
+        "context pipeline seed | selected=%s | final_candidates=%s | seeded=%s | missing_profile=%s | battlefield=%s | battlefield_state=%s | handoff=%s",
+        len(selected_snapshots),
+        len(final_candidate_rank),
+        len(ranked_decisions),
+        missing_profile_count,
+        decision_bundle.temporal_migration_decision.main_battlefield_theme if decision_bundle is not None and decision_bundle.temporal_migration_decision is not None else "-",
+        decision_bundle.temporal_migration_decision.battlefield_state if decision_bundle is not None and decision_bundle.temporal_migration_decision is not None else "-",
+        (
+            (decision_bundle.temporal_migration_decision.handoff_from or "-")
+            + "->"
+            + (decision_bundle.temporal_migration_decision.handoff_to or "-")
+        )
+        if decision_bundle is not None and decision_bundle.temporal_migration_decision is not None
+        else "-",
     )
-    ranked_decisions = tuple(decision for decision, _ in ranked)
     focus_symbols = tuple(decision.symbol for decision in ranked_decisions[:10])
     summary = context.market_summary
+
+    context_notes = tuple(str(note) for note in tuple(getattr(context, "notes", ()) or ()) if str(note))
     notes = (
         f"mainline_sector={summary.mainline_sector or 'N/A'}",
         f"top_turnover_count={len(summary.top_turnover_symbols)}",
@@ -308,7 +795,8 @@ def build_context_strategy_bundle_for_symbols(
         f"auction_top20_vs_prev_ratio={float(getattr(summary, 'auction_top20_vs_prev_ratio', 1.0) or 1.0):.3f}",
         f"stock_ctx_recomputed={stock_ctx_recomputed}",
         f"stock_ctx_reused={stock_ctx_reused}",
-    )
+        "legacy_candidate_fallback=removed",
+    ) + context_notes + decision_notes
     bundle = ContextStrategyBundle(
         context=context,
         profiles=profiles,
@@ -316,760 +804,7 @@ def build_context_strategy_bundle_for_symbols(
         stock_selection_contexts=stock_selection_contexts,
         decisions=ranked_decisions,
         focus_symbols=focus_symbols,
+        decision_bundle=decision_bundle,
         notes=notes,
     )
     return bundle
-
-
-def _passes_trade_conclusion_gate(selection, snapshot, theme_context) -> bool:
-    if not stock_passes_conclusion_gate(selection, snapshot, theme_context):
-        return False
-    if selection is not None and selection.theme_trade_label == "high_event" and not selection.is_true_leader:
-        return False
-    if selection is not None and selection.open_confirm_state == "falsified" and not selection.is_true_leader:
-        return False
-    if selection is not None and not selection.theme_tradable:
-        return False
-    if selection is not None and selection.theme_fakeout_level in {"high", "extreme"} and not selection.is_true_leader:
-        return False
-    if selection is not None and selection.theme_x_score >= 5.6 and not selection.is_true_leader:
-        return False
-    if (
-        selection is not None
-        and theme_context is not None
-        and theme_context.trade_conclusion == "leader_only_alive"
-        and not selection.is_true_leader
-    ):
-        front_row_override = bool(
-            selection.is_front_row
-            and selection.theme_tradable
-            and selection.hot_rank <= 80
-        )
-        if not front_row_override:
-            return False
-    if (
-        selection is not None
-        and theme_context is not None
-        and theme_context.bias_action in {"observe_only", "avoid_after_open_confirm"}
-        and theme_context.open_confirm_state in {"maintained", "falsified"}
-        and not selection.is_true_leader
-        and float(getattr(theme_context, "phase_priority_bias", 0.0) or 0.0) <= 0.0
-    ):
-        return False
-    return True
-
-
-def _relative_trade_conclusion_override(
-    selection,
-    snapshot,
-    theme_context,
-    relative_profile: _RelativeStrengthProfile | None = None,
-) -> bool:
-    if selection is None or snapshot is None or theme_context is None:
-        return False
-    if str(getattr(theme_context, "trade_conclusion", "") or "") != "leader_only_alive":
-        return False
-    if selection.is_true_leader or not selection.is_front_row:
-        return False
-    if not selection.theme_tradable:
-        return False
-    if selection.open_follow_state in {"weak_follow", "faded"}:
-        return False
-    if int(getattr(snapshot, "leader_rank_in_theme", 999) or 999) > 3:
-        return False
-    if selection.daily_height_bucket == "high":
-        return False
-    if not _has_non_hot_front_row_strength(selection, snapshot, relative_profile):
-        return False
-    return bool(
-        selection.open_undertake_score >= 5.6
-        and selection.execution_quality_score >= 5.6
-    )
-
-
-def _resolve_top_n(size: int, *, minimum: int, ratio: float, maximum: int | None = None) -> int:
-    if size <= 0:
-        return 0
-    top_n = max(minimum, int(round(size * ratio)))
-    if maximum is not None:
-        top_n = min(top_n, maximum)
-    return max(1, min(size, top_n))
-
-
-def _front_strength_expansion_factor(context: IntradayContext) -> float:
-    return topn_expansion_factor(build_market_topn_slice_comparison(getattr(context, "market_summary", None)))
-
-
-def _top_symbols_by_metric(
-    symbol_metric_pairs: list[tuple[str, float]],
-    *,
-    minimum: int,
-    ratio: float,
-    maximum: int | None = None,
-) -> frozenset[str]:
-    valid_pairs = [(symbol, float(value)) for symbol, value in symbol_metric_pairs if symbol]
-    if not valid_pairs:
-        return frozenset()
-    ranked = sorted(valid_pairs, key=lambda pair: pair[1], reverse=True)
-    limit = _resolve_top_n(len(ranked), minimum=minimum, ratio=ratio, maximum=maximum)
-    return frozenset(symbol for symbol, _ in ranked[:limit])
-
-
-def _build_relative_strength_profile(bundle: ContextStrategyBundle) -> _RelativeStrengthProfile:
-    stock_context_map = {item.symbol: item for item in bundle.stock_selection_contexts}
-    snapshot_map = {item.symbol: item for item in bundle.context.stock_snapshots}
-    symbols = [decision.symbol for decision in bundle.decisions if decision.symbol in stock_context_map and decision.symbol in snapshot_map]
-    expansion_factor = _front_strength_expansion_factor(bundle.context)
-
-    def metric_pairs_from_snapshot(attr: str) -> list[tuple[str, float]]:
-        return [(symbol, float(getattr(snapshot_map[symbol], attr, 0.0) or 0.0)) for symbol in symbols]
-
-    def metric_pairs_from_selection(attr: str) -> list[tuple[str, float]]:
-        return [(symbol, float(getattr(stock_context_map[symbol], attr, 0.0) or 0.0)) for symbol in symbols]
-
-    amount_ratio_pairs: list[tuple[str, float]] = []
-    for symbol in symbols:
-        snapshot = snapshot_map[symbol]
-        auction_amount = float(getattr(snapshot, "auction_amount", 0.0) or 0.0)
-        amount_2m = float(getattr(snapshot, "amount_2m", 0.0) or 0.0)
-        ratio_2m = (amount_2m / auction_amount) if auction_amount > 0 else 0.0
-        amount_ratio_pairs.append((symbol, ratio_2m))
-
-    return _RelativeStrengthProfile(
-        amount_2m_top=_top_symbols_by_metric(metric_pairs_from_snapshot("amount_2m"), minimum=10, ratio=0.12 * expansion_factor, maximum=24),
-        amount_ratio_2m_top=_top_symbols_by_metric(amount_ratio_pairs, minimum=10, ratio=0.14 * expansion_factor, maximum=28),
-        open_undertake_top=_top_symbols_by_metric(metric_pairs_from_selection("open_undertake_score"), minimum=12, ratio=0.16 * expansion_factor, maximum=28),
-        execution_quality_top=_top_symbols_by_metric(metric_pairs_from_selection("execution_quality_score"), minimum=12, ratio=0.16 * expansion_factor, maximum=28),
-        shape_quality_top=_top_symbols_by_metric(metric_pairs_from_selection("shape_quality_score"), minimum=12, ratio=0.18 * expansion_factor, maximum=30),
-        turnover_quality_top=_top_symbols_by_metric(metric_pairs_from_selection("turnover_quality_score"), minimum=12, ratio=0.18 * expansion_factor, maximum=30),
-        theme_core_top=_top_symbols_by_metric(metric_pairs_from_selection("theme_core_score"), minimum=14, ratio=0.20 * expansion_factor, maximum=36),
-    )
-
-
-def _has_non_hot_front_row_strength(selection, snapshot, relative_profile: _RelativeStrengthProfile | None = None) -> bool:
-    if selection is None or snapshot is None:
-        return False
-    if selection.hot_rank <= 80:
-        return False
-    symbol = str(getattr(snapshot, "symbol", "") or "")
-    relative_hit = False
-    if relative_profile is not None and symbol:
-        relative_hit = (
-            symbol in relative_profile.amount_2m_top
-            and symbol in relative_profile.open_undertake_top
-            and symbol in relative_profile.execution_quality_top
-        )
-        if (
-            not relative_hit
-            and snapshot.leader_rank_in_theme <= 3
-            and symbol in relative_profile.amount_2m_top
-            and symbol in relative_profile.shape_quality_top
-            and symbol in relative_profile.turnover_quality_top
-        ):
-            relative_hit = True
-        if (
-            not relative_hit
-            and symbol in relative_profile.amount_ratio_2m_top
-            and symbol in relative_profile.shape_quality_top
-            and selection.open_follow_state in {"confirmed", "repair_strength"}
-        ):
-            relative_hit = True
-        if (
-            not relative_hit
-            and selection.is_front_row
-            and symbol in relative_profile.theme_core_top
-            and symbol in relative_profile.execution_quality_top
-            and symbol in relative_profile.shape_quality_top
-        ):
-            relative_hit = True
-    if relative_hit:
-        return True
-    if (
-        selection.is_front_row
-        and snapshot.amount_2m >= 28_000_000
-        and selection.open_undertake_score >= 5.0
-        and selection.execution_quality_score >= 5.4
-    ):
-        return True
-    if (
-        snapshot.leader_rank_in_theme <= 3
-        and snapshot.amount_2m >= 35_000_000
-        and selection.open_undertake_score >= 5.2
-        and selection.execution_quality_score >= 5.6
-    ):
-        return True
-    if (
-        snapshot.auction_amount > 0
-        and snapshot.amount_2m >= snapshot.auction_amount * 1.3
-        and selection.shape_quality_score >= 6.0
-        and selection.open_follow_state in {"confirmed", "repair_strength"}
-    ):
-        return True
-    return False
-
-
-def _passes_shape_quality_gate(selection, snapshot, relative_profile: _RelativeStrengthProfile | None = None) -> bool:
-    if selection is None:
-        return True
-    strong_non_hot_signal = _has_non_hot_front_row_strength(selection, snapshot, relative_profile)
-    if not selection.is_active_pool and selection.theme_core_score < 6.5 and not strong_non_hot_signal:
-        return False
-    if selection.kline_pattern in {"high_open_then_weak", "volume_up_price_flat"}:
-        return False
-    if selection.open_follow_state == "faded" and selection.auction_open_bucket in {"overheat_high_open", "near_limit_open"}:
-        return False
-    if (
-        not selection.is_true_leader
-        and selection.auction_open_bucket == "near_limit_open"
-        and selection.open_follow_state != "confirmed"
-    ):
-        return False
-    if selection.structure_score < 4.0 and not selection.is_true_leader:
-        return False
-    if not selection.is_true_leader and selection.shape_quality_score < 5.5 and selection.execution_quality_score < 5.2:
-        return False
-    if not selection.is_true_leader and selection.open_undertake_score < 4.8 and selection.execution_quality_score < 5.4:
-        return False
-    if not selection.is_front_row and not selection.is_true_leader:
-        return False
-    if (
-        not selection.is_true_leader
-        and not selection.is_active_pool
-        and selection.theme_core_score < 7.0
-        and not strong_non_hot_signal
-    ):
-        return False
-    if (
-        not selection.is_true_leader
-        and selection.is_front_row
-        and selection.activity_score < 6.0
-        and selection.theme_core_score < 6.5
-        and selection.structure_score < 6.0
-        and not strong_non_hot_signal
-    ):
-        return False
-    return True
-
-
-def _passes_heat_and_board_gate(selection, snapshot, relative_profile: _RelativeStrengthProfile | None = None) -> bool:
-    if selection is None:
-        return True
-    strong_non_hot_signal = _has_non_hot_front_row_strength(selection, snapshot, relative_profile)
-    if (
-        not selection.is_true_leader
-        and selection.auction_open_bucket == "overheat_high_open"
-        and selection.open_follow_state == "weak_follow"
-        and selection.open_undertake_score < 5.8
-    ):
-        return False
-    if (
-        not selection.is_true_leader
-        and selection.hot_rank > 120
-        and selection.turnover_quality_score < 5.0
-        and selection.shape_quality_score < 6.0
-        and not strong_non_hot_signal
-    ):
-        return False
-    if (
-        snapshot is not None
-        and snapshot.lb_days >= 1
-        and not selection.is_true_leader
-        and selection.hot_rank > 100
-        and selection.heat_flow_score < 5.0
-        and selection.open_undertake_score < 5.6
-        and not strong_non_hot_signal
-    ):
-        return False
-    if (
-        snapshot is not None
-        and snapshot.lb_days >= 1
-        and not selection.is_true_leader
-        and snapshot.leader_rank_in_theme > 3
-        and snapshot.auction_amount < 20_000_000
-        and snapshot.amount_2m < 25_000_000
-        and selection.execution_quality_score < 6.0
-        and not strong_non_hot_signal
-    ):
-        return False
-    return True
-
-
-def _passes_action_gate(
-    bundle: ContextStrategyBundle,
-    decision,
-    selection,
-    snapshot,
-    min_confidence: int,
-) -> bool:
-    if selection is not None and decision.action in {"dragon_early_board", "early_boarding_candidate"}:
-        if selection.timing_score < 4.5 and not selection.is_true_leader:
-            return False
-    if decision.confidence < min_confidence:
-        return False
-    if decision.action in ("avoid_after_failed_promotion", "do_not_chase"):
-        return False
-    if decision.action == "observe_only":
-        validation = _opening_validation_for_selection(bundle, selection, snapshot)
-        if (
-            validation is not None
-            and selection is not None
-            and str(getattr(validation, "validation_state", "") or "") == "confirmed"
-            and str(getattr(validation, "tradable_level", "") or "") in {"attack", "probe"}
-        ):
-            if selection.is_true_leader:
-                return True
-            return bool(
-                selection.is_front_row
-                and selection.open_follow_state not in {"weak_follow", "faded"}
-                and selection.open_undertake_score >= 5.8
-                and selection.execution_quality_score >= 5.8
-            )
-        return False
-    return True
-
-
-def _passes_watch_action_gate(decision, selection, min_confidence: int) -> bool:
-    if decision.confidence < min_confidence:
-        return False
-    if decision.action in ("avoid_after_failed_promotion", "do_not_chase"):
-        return False
-    if selection is None:
-        return False
-    if decision.action == "observe_only":
-        if selection.is_true_leader:
-            return True
-        if selection.is_front_row and (
-            selection.theme_core_score >= 6.6
-            or selection.execution_quality_score >= 6.0
-            or selection.open_undertake_score >= 5.8
-            or selection.activity_score >= 6.8
-        ):
-            return True
-        return False
-    return True
-
-
-def _passes_watch_trade_conclusion_gate(selection, snapshot, theme_context) -> bool:
-    if selection is None:
-        return False
-    if selection.open_confirm_state == "falsified" and not selection.is_true_leader:
-        return False
-    if selection.theme_fakeout_level == "extreme" and not selection.is_true_leader:
-        return False
-    if selection.theme_tradable:
-        return _passes_trade_conclusion_gate(selection, snapshot, theme_context)
-    return bool(
-        selection.is_true_leader
-        or (
-            selection.is_front_row
-            and selection.theme_core_score >= 6.8
-            and selection.execution_quality_score >= 5.8
-            and selection.open_undertake_score >= 5.6
-        )
-    )
-
-
-def _passes_watch_shape_quality_gate(selection, snapshot, relative_profile: _RelativeStrengthProfile | None = None) -> bool:
-    if selection is None:
-        return False
-    if _passes_shape_quality_gate(selection, snapshot, relative_profile):
-        return True
-    strong_non_hot_signal = _has_non_hot_front_row_strength(selection, snapshot, relative_profile)
-    if selection.kline_pattern in {"high_open_then_weak", "volume_up_price_flat"}:
-        return False
-    if selection.open_follow_state == "faded" and selection.auction_open_bucket in {"overheat_high_open", "near_limit_open"}:
-        return False
-    return bool(
-        (selection.is_true_leader or selection.is_front_row or strong_non_hot_signal)
-        and selection.execution_quality_score >= 5.4
-        and selection.open_undertake_score >= 5.0
-    )
-
-
-def _passes_watch_heat_and_board_gate(selection, snapshot, relative_profile: _RelativeStrengthProfile | None = None) -> bool:
-    if selection is None:
-        return False
-    if _passes_heat_and_board_gate(selection, snapshot, relative_profile):
-        return True
-    strong_non_hot_signal = _has_non_hot_front_row_strength(selection, snapshot, relative_profile)
-    return bool(
-        (selection.is_true_leader or selection.is_front_row or strong_non_hot_signal)
-        and selection.execution_quality_score >= 5.4
-        and selection.open_undertake_score >= 5.0
-        and (selection.hot_rank <= 160 or strong_non_hot_signal)
-    )
-
-
-def _opening_validation_for_selection(
-    bundle: ContextStrategyBundle,
-    selection: StockSelectionContext | None,
-    snapshot=None,
-):
-    return match_opening_validation(
-        getattr(bundle.context, "opening_validation_bundle", None),
-        snapshot=snapshot,
-        selection=selection,
-    )
-
-
-def _upgrade_decision_action_by_opening_validation(
-    bundle: ContextStrategyBundle,
-    decision: AuctionLadderDecision,
-    selection: StockSelectionContext | None,
-    snapshot,
-) -> AuctionLadderDecision:
-    if selection is None or snapshot is None or decision.action != "observe_only":
-        return decision
-    validation = _opening_validation_for_selection(bundle, selection, snapshot)
-    if validation is None:
-        return decision
-    if str(getattr(validation, "validation_state", "") or "") != "confirmed":
-        return decision
-    if str(getattr(validation, "tradable_level", "") or "") not in {"attack", "probe"}:
-        return decision
-    if selection.is_true_leader:
-        return replace(
-            decision,
-            action="leader_watch",
-            setup_id="opening_validation_leader_watch",
-            confidence=max(int(getattr(decision, "confidence", 0) or 0), 72),
-            kelly_position_pct=max(float(getattr(decision, "kelly_position_pct", 0.02) or 0.02), 0.03),
-            reasons=tuple(decision.reasons) + ("opening validation confirmed the theme leader",),
-        )
-    if (
-        selection.is_front_row
-        and selection.open_follow_state in {"confirmed", "repair_strength"}
-        and selection.open_undertake_score >= 5.8
-        and selection.execution_quality_score >= 5.8
-    ):
-        return replace(
-            decision,
-            action="confirm_then_go",
-            setup_id="opening_validation_confirm_then_go",
-            confidence=max(int(getattr(decision, "confidence", 0) or 0), 68),
-            kelly_position_pct=max(float(getattr(decision, "kelly_position_pct", 0.02) or 0.02), 0.04),
-            reasons=tuple(decision.reasons) + ("opening validation confirmed a front-row continuation candidate",),
-        )
-    if (
-        selection.is_front_row
-        and selection.open_follow_state not in {"weak_follow", "faded"}
-        and selection.open_undertake_score >= 5.6
-        and selection.execution_quality_score >= 5.6
-    ):
-        return replace(
-            decision,
-            action="front_row_watch",
-            setup_id="opening_validation_front_row_watch",
-            confidence=max(int(getattr(decision, "confidence", 0) or 0), 64),
-            kelly_position_pct=max(float(getattr(decision, "kelly_position_pct", 0.02) or 0.02), 0.03),
-            reasons=tuple(decision.reasons) + ("opening validation kept the front row tradable after the open",),
-        )
-    return decision
-
-
-def _upgrade_bundle_decisions_by_opening_validation(
-    bundle: ContextStrategyBundle,
-) -> ContextStrategyBundle:
-    stock_context_map = {item.symbol: item for item in bundle.stock_selection_contexts}
-    snapshot_map = {item.symbol: item for item in bundle.context.stock_snapshots}
-    upgraded = tuple(
-        _upgrade_decision_action_by_opening_validation(
-            bundle,
-            decision,
-            stock_context_map.get(decision.symbol),
-            snapshot_map.get(decision.symbol),
-        )
-        for decision in bundle.decisions
-    )
-    if upgraded == bundle.decisions:
-        return bundle
-    return replace(bundle, decisions=upgraded)
-
-
-def _opening_validation_trade_conclusion_override(
-    bundle: ContextStrategyBundle,
-    selection: StockSelectionContext | None,
-    snapshot,
-) -> bool:
-    validation = _opening_validation_for_selection(bundle, selection, snapshot)
-    if validation is None or selection is None or snapshot is None:
-        return False
-    state = str(getattr(validation, "validation_state", "") or "")
-    tradable_level = str(getattr(validation, "tradable_level", "") or "")
-    if state != "confirmed" or tradable_level not in {"attack", "probe"}:
-        return False
-    if selection.is_true_leader:
-        return True
-    if not selection.is_front_row:
-        return False
-    if selection.open_follow_state in {"weak_follow", "faded"}:
-        return False
-    if float(getattr(snapshot, "amount_2m", 0.0) or 0.0) <= 0.0:
-        return False
-    return bool(
-        selection.open_undertake_score >= 5.6
-        and selection.execution_quality_score >= 5.6
-    )
-
-
-def _passes_opening_validation_trade_gate(
-    bundle: ContextStrategyBundle,
-    decision: AuctionLadderDecision,
-    selection: StockSelectionContext | None,
-    snapshot=None,
-) -> bool:
-    validation = _opening_validation_for_selection(bundle, selection, snapshot)
-    if validation is None or selection is None:
-        return True
-    state = str(getattr(validation, "validation_state", "") or "")
-    tradable_level = str(getattr(validation, "tradable_level", "") or "")
-    if state == "confirmed":
-        if tradable_level == "attack":
-            return True
-        if tradable_level == "probe":
-            return bool(
-                selection.is_true_leader
-                or selection.is_front_row
-                or decision.action in {"small_probe_only", "leader_watch", "front_row_watch", "confirm_then_go"}
-            )
-        return selection.is_true_leader
-    if state == "watch":
-        return bool(
-            selection.is_true_leader
-            or (
-                selection.is_front_row
-                and selection.open_undertake_score >= 5.8
-                and selection.execution_quality_score >= 5.8
-            )
-        )
-    if state == "falsified" or tradable_level == "avoid":
-        return selection.is_true_leader
-    return True
-
-
-def _passes_opening_validation_watch_gate(
-    bundle: ContextStrategyBundle,
-    selection: StockSelectionContext | None,
-    snapshot=None,
-) -> bool:
-    validation = _opening_validation_for_selection(bundle, selection, snapshot)
-    if validation is None or selection is None:
-        return True
-    state = str(getattr(validation, "validation_state", "") or "")
-    tradable_level = str(getattr(validation, "tradable_level", "") or "")
-    if state in {"confirmed", "watch"}:
-        return True
-    if state == "falsified" or tradable_level == "avoid":
-        return selection.is_true_leader
-    return True
-
-
-def _is_confirmed_tradeable_validation(validation) -> bool:
-    if validation is None:
-        return False
-    state = str(getattr(validation, "validation_state", "") or "")
-    tradable_level = str(getattr(validation, "tradable_level", "") or "")
-    return state == "confirmed" and tradable_level in {"attack", "probe"}
-
-
-def _passes_hard_trade_veto_only(
-    bundle: ContextStrategyBundle,
-    decision: AuctionLadderDecision,
-    selection: StockSelectionContext | None,
-    snapshot,
-) -> bool:
-    if decision.action in {"avoid_after_failed_promotion", "do_not_chase"}:
-        return False
-    if not _passes_opening_validation_trade_gate(bundle, decision, selection, snapshot):
-        return False
-    return True
-
-
-def _confirmed_tradeable_target_count(validation) -> int:
-    if not _is_confirmed_tradeable_validation(validation):
-        return 0
-    tradable_level = str(getattr(validation, "tradable_level", "") or "")
-    if tradable_level == "attack":
-        return 2
-    if tradable_level == "probe":
-        return 1
-    return 0
-
-
-def _is_backfill_trade_candidate(
-    bundle: ContextStrategyBundle,
-    decision: AuctionLadderDecision,
-    selection: StockSelectionContext | None,
-    snapshot,
-    *,
-    min_confidence: int,
-) -> bool:
-    validation = _opening_validation_for_selection(bundle, selection, snapshot)
-    if not _is_confirmed_tradeable_validation(validation):
-        return False
-    if selection is None or snapshot is None:
-        return False
-    if not _passes_hard_trade_veto_only(bundle, decision, selection, snapshot):
-        return False
-    if int(getattr(decision, "confidence", 0) or 0) < min_confidence:
-        return False
-    if selection.kline_pattern in {"high_open_then_weak", "volume_up_price_flat", "explosive_failed_board"}:
-        return False
-    if selection.open_follow_state == "faded":
-        return False
-    if selection.daily_height_bucket == "high" and not selection.is_true_leader:
-        return False
-    if decision.action == "observe_only":
-        return False
-    return bool(
-        selection.is_true_leader
-        or (
-            selection.is_front_row
-            and selection.open_follow_state not in {"weak_follow", "faded"}
-        )
-    )
-
-
-def _backfill_trade_candidates_for_confirmed_themes(
-    bundle: ContextStrategyBundle,
-    candidates: list[AuctionLadderDecision],
-    *,
-    min_confidence: int,
-) -> tuple[AuctionLadderDecision, ...]:
-    stock_context_map = {item.symbol: item for item in bundle.stock_selection_contexts}
-    snapshot_map = {item.symbol: item for item in bundle.context.stock_snapshots}
-    confirmed_by_theme: dict[str, list[AuctionLadderDecision]] = {}
-    existing_theme_counts: dict[str, int] = {}
-    theme_target_counts: dict[str, int] = {}
-
-    for decision in candidates:
-        selection = stock_context_map.get(decision.symbol)
-        snapshot = snapshot_map.get(decision.symbol)
-        validation = _opening_validation_for_selection(bundle, selection, snapshot)
-        if _is_confirmed_tradeable_validation(validation) and selection is not None:
-            plate_name = selection.plate_name or ""
-            existing_theme_counts[plate_name] = existing_theme_counts.get(plate_name, 0) + 1
-            theme_target_counts[plate_name] = max(
-                theme_target_counts.get(plate_name, 0),
-                _confirmed_tradeable_target_count(validation),
-            )
-
-    for decision in bundle.decisions:
-        selection = stock_context_map.get(decision.symbol)
-        snapshot = snapshot_map.get(decision.symbol)
-        validation = _opening_validation_for_selection(bundle, selection, snapshot)
-        if not _is_confirmed_tradeable_validation(validation):
-            continue
-        if selection is None:
-            continue
-        plate_name = selection.plate_name or ""
-        target_count = _confirmed_tradeable_target_count(validation)
-        if target_count <= 0:
-            continue
-        theme_target_counts[plate_name] = max(theme_target_counts.get(plate_name, 0), target_count)
-        if existing_theme_counts.get(plate_name, 0) >= target_count:
-            continue
-        if not _is_backfill_trade_candidate(
-            bundle,
-            decision,
-            selection,
-            snapshot,
-            min_confidence=min_confidence,
-        ):
-            continue
-        confirmed_by_theme.setdefault(plate_name, []).append(decision)
-
-    if not confirmed_by_theme:
-        return tuple(candidates)
-
-    existing_symbols = {item.symbol for item in candidates}
-    backfilled: list[AuctionLadderDecision] = list(candidates)
-    for plate_name, themed_decisions in confirmed_by_theme.items():
-        ranked = sorted(
-            themed_decisions,
-            key=lambda item: (
-                stock_context_map.get(item.symbol).is_true_leader if stock_context_map.get(item.symbol) is not None else False,
-                stock_context_map.get(item.symbol).is_front_row if stock_context_map.get(item.symbol) is not None else False,
-                -float(getattr(stock_context_map.get(item.symbol), "stock_amount_2m_rank_in_theme_pct", 1.0) or 1.0),
-                -float(getattr(stock_context_map.get(item.symbol), "stock_execution_rank_in_theme_pct", 1.0) or 1.0),
-                float(getattr(stock_context_map.get(item.symbol), "execution_quality_score", 0.0) or 0.0),
-                float(getattr(stock_context_map.get(item.symbol), "open_undertake_score", 0.0) or 0.0),
-                float(getattr(item, "confidence", 0) or 0),
-            ),
-            reverse=True,
-        )
-        picks_needed = max(theme_target_counts.get(plate_name, 0) - existing_theme_counts.get(plate_name, 0), 0)
-        picks_added = 0
-        for decision in ranked:
-            if decision.symbol in existing_symbols:
-                continue
-            backfilled.append(decision)
-            existing_symbols.add(decision.symbol)
-            picks_added += 1
-            if picks_added >= picks_needed:
-                break
-    return tuple(backfilled)
-
-
-def filter_trade_candidates(
-    bundle: ContextStrategyBundle,
-    *,
-    min_confidence: int = 60,
-) -> tuple[AuctionLadderDecision, ...]:
-    candidates = []
-    relative_profile = _build_relative_strength_profile(bundle)
-    stock_context_map = {item.symbol: item for item in bundle.stock_selection_contexts}
-    snapshot_map = {item.symbol: item for item in bundle.context.stock_snapshots}
-    for decision in bundle.decisions:
-        selection = stock_context_map.get(decision.symbol)
-        snapshot = snapshot_map.get(decision.symbol)
-        theme_context_map = getattr(bundle, "theme_context_map", None)
-        theme_context = theme_context_map.get(selection.plate_name) if isinstance(theme_context_map, dict) and selection is not None else None
-        if (
-            not _passes_trade_conclusion_gate(selection, snapshot, theme_context)
-            and not _relative_trade_conclusion_override(selection, snapshot, theme_context, relative_profile)
-            and not _opening_validation_trade_conclusion_override(bundle, selection, snapshot)
-        ):
-            continue
-        if not _passes_opening_validation_trade_gate(bundle, decision, selection, snapshot):
-            continue
-        if not _passes_shape_quality_gate(selection, snapshot, relative_profile):
-            continue
-        if not _passes_heat_and_board_gate(selection, snapshot, relative_profile):
-            continue
-        if not _passes_action_gate(bundle, decision, selection, snapshot, min_confidence):
-            continue
-        candidates.append(decision)
-    return _backfill_trade_candidates_for_confirmed_themes(
-        bundle,
-        candidates,
-        min_confidence=min_confidence,
-    )
-
-
-def filter_watch_candidates(
-    bundle: ContextStrategyBundle,
-    *,
-    min_confidence: int = 60,
-) -> tuple[AuctionLadderDecision, ...]:
-    candidates = []
-    relative_profile = _build_relative_strength_profile(bundle)
-    stock_context_map = {item.symbol: item for item in bundle.stock_selection_contexts}
-    snapshot_map = {item.symbol: item for item in bundle.context.stock_snapshots}
-    for decision in bundle.decisions:
-        selection = stock_context_map.get(decision.symbol)
-        snapshot = snapshot_map.get(decision.symbol)
-        theme_context_map = getattr(bundle, "theme_context_map", None)
-        theme_context = theme_context_map.get(selection.plate_name) if isinstance(theme_context_map, dict) and selection is not None else None
-        if not _passes_watch_trade_conclusion_gate(selection, snapshot, theme_context):
-            continue
-        if not _passes_opening_validation_watch_gate(bundle, selection, snapshot):
-            continue
-        if not _passes_watch_shape_quality_gate(selection, snapshot, relative_profile):
-            continue
-        if not _passes_watch_heat_and_board_gate(selection, snapshot, relative_profile):
-            continue
-        if not _passes_watch_action_gate(decision, selection, min_confidence):
-            continue
-        candidates.append(decision)
-    return tuple(candidates)
